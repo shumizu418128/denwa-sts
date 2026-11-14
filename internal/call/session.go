@@ -24,6 +24,9 @@ const (
 	rxQueueSize       = 512
 	utteranceQueue    = 4
 	streamChanSize    = 64
+	textChunkQueue    = 8
+	// toneLeadFrames は保留音を、RTP の 20ms 間隔より少し先まで溜める量。
+	toneLeadFrames = 3
 )
 
 var unusablePeerAddrs = map[string]bool{"": true, "0.0.0.0": true, "127.0.0.1": true, "::": true}
@@ -419,11 +422,10 @@ func (s *Session) openPlayback(turnCtx context.Context) *utterancePlayback {
 			<-toneDone
 		},
 	}
-	// 最初の応答音声まで「プップッ」という保留音を 20ms ごとに流す
+	// 最初の応答音声まで「プップッ」という保留音を流す。
+	// 数フレーム先まで溜めて、送信側が空いた瞬間に無音を挟まないようにする。
 	go func() {
 		defer close(toneDone)
-		ticker := time.NewTicker(config.FrameDuration)
-		defer ticker.Stop()
 		for frameIdx := 0; ; frameIdx++ {
 			select {
 			case <-turnCtx.Done():
@@ -432,12 +434,18 @@ func (s *Session) openPlayback(turnCtx context.Context) *utterancePlayback {
 				return
 			case ulawCh <- audio.ThinkingToneFrame(frameIdx):
 			}
+			if len(ulawCh) < toneLeadFrames {
+				continue
+			}
+			timer := time.NewTimer(config.FrameDuration)
 			select {
 			case <-turnCtx.Done():
+				timer.Stop()
 				return
 			case <-stopTone:
+				timer.Stop()
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
 		}
 	}()
@@ -496,6 +504,7 @@ func (s *Session) respondBuffered(turnCtx context.Context, res Responder, pcm []
 }
 
 // respondStreaming はテキスト断片が揃い次第、全文の生成完了を待たずに音声合成を始める。
+// 再生は2断片そろうか、生成が終わるまで始めない。最初の断片だけで流すと、次の合成が終わる前に RTP が空く。
 func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreamer, pcm []int16, started time.Time, play *utterancePlayback) {
 	if s.opts.Synth == nil {
 		play.finish()
@@ -506,7 +515,7 @@ func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreame
 	streamCtx, streamCancel := context.WithCancel(turnCtx)
 	defer streamCancel()
 
-	chunks := make(chan string)
+	chunks := make(chan string, textChunkQueue)
 	type synthResult struct {
 		err       error
 		bytes     int
@@ -517,8 +526,32 @@ func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreame
 
 	go func() {
 		var total int
-		firstAudio := true
+		var pending []byte
+		var synthesized int
+		released := false
 		var result synthResult
+
+		flush := func() bool {
+			if len(pending) == 0 {
+				return true
+			}
+			if !released {
+				released = true
+				play.stopTone()
+				if !sendULawChunk(turnCtx, play.ulawCh, leadSilence()) {
+					result.err = turnCtx.Err()
+					return false
+				}
+			}
+			if !sendULawChunk(turnCtx, play.ulawCh, pending) {
+				result.err = turnCtx.Err()
+				return false
+			}
+			total += len(pending)
+			pending = nil
+			return true
+		}
+
 		for chunk := range chunks {
 			if streamCtx.Err() != nil {
 				result.err = streamCtx.Err()
@@ -538,22 +571,21 @@ func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreame
 			if len(ulaw) == 0 {
 				continue
 			}
-			if firstAudio {
-				firstAudio = false
-				play.stopTone()
-				if !sendULawChunk(turnCtx, play.ulawCh, leadSilence()) {
-					result.err = turnCtx.Err()
-					break
-				}
+			pending = append(pending, ulaw...)
+			synthesized++
+			slog.Info("STS音声断片", "channel", s.channelID, "text", chunk, "bytes", len(ulaw), "elapsed", time.Since(started).Round(10*time.Millisecond))
+			// 最初の1断片は、次が合成できるまで保留音のまま持つ。
+			if !released && synthesized < 2 {
+				continue
 			}
-			if !sendULawChunk(turnCtx, play.ulawCh, ulaw) {
-				result.err = turnCtx.Err()
+			if !flush() {
 				break
 			}
-			total += len(ulaw)
-			slog.Info("STS音声断片", "channel", s.channelID, "text", chunk, "bytes", len(ulaw), "elapsed", time.Since(started).Round(10*time.Millisecond))
 		}
-		if firstAudio {
+		if len(pending) > 0 && !flush() && result.err == nil {
+			result.err = turnCtx.Err()
+		}
+		if !released {
 			play.stopTone()
 		}
 		result.bytes = total

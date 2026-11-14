@@ -243,7 +243,7 @@ func (s *Session) SendULawContext(ctx context.Context, payload []byte) bool {
 }
 
 // SendULawStream はチャンク列から届く μ-law 音声を、初期プリバッファ後に 20ms 間隔で送出する。
-// 中断されたときは false を返す。
+// 再生開始後にデータが途切れてもパケットは止めず、無音で RTP の時刻を進める。中断されたときは false を返す。
 func (s *Session) SendULawStream(chunks <-chan []byte) bool {
 	return s.SendULawStreamContext(context.Background(), chunks)
 }
@@ -269,8 +269,58 @@ func (s *Session) sendStream(ctx context.Context, chunks <-chan []byte, prebuffe
 	offset := 0
 	closed := false
 
-	fillUntil := func(target int) bool {
-		for !closed && len(buf)-offset < target {
+	appendChunk := func(chunk []byte) {
+		if len(chunk) == 0 {
+			return
+		}
+		if offset > 0 && offset >= len(buf)/2 {
+			remaining := len(buf) - offset
+			copy(buf[:remaining], buf[offset:])
+			buf = buf[:remaining]
+			offset = 0
+		}
+		buf = append(buf, chunk...)
+	}
+
+	// timer が nil のときは期限なしで待つ。期限に達したときは timedOut を返す。
+	readChunk := func(timer *time.Timer) (timedOut bool, alive bool) {
+		var timeout <-chan time.Time
+		if timer != nil {
+			timeout = timer.C
+		}
+		for {
+			select {
+			case <-s.stop:
+				return false, false
+			case <-ctx.Done():
+				return false, false
+			case chunk, ok := <-chunks:
+				if !ok {
+					closed = true
+					return false, true
+				}
+				if len(chunk) == 0 {
+					continue
+				}
+				appendChunk(chunk)
+				return false, true
+			case <-timeout:
+				return true, true
+			}
+		}
+	}
+
+	stopTimer := func(timer *time.Timer) {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+
+	drain := func() bool {
+		for !closed {
 			select {
 			case <-s.stop:
 				return false
@@ -281,58 +331,40 @@ func (s *Session) sendStream(ctx context.Context, chunks <-chan []byte, prebuffe
 					closed = true
 					return true
 				}
-				if len(chunk) == 0 {
-					continue
-				}
-				if offset > 0 && offset >= len(buf)/2 {
-					remaining := len(buf) - offset
-					copy(buf[:remaining], buf[offset:])
-					buf = buf[:remaining]
-					offset = 0
-				}
-				buf = append(buf, chunk...)
+				appendChunk(chunk)
+			default:
+				return true
 			}
 		}
 		return true
 	}
 
 	if prebuffer > 0 {
-		if !fillUntil(prebuffer) {
+		for !closed && len(buf)-offset < prebuffer {
+			if _, alive := readChunk(nil); !alive {
+				return false
+			}
+		}
+	}
+	// 最初の実データが来るまでは無音を送らない。保留音も応答も、ここでトークスパートを始める。
+	for !closed && len(buf)-offset == 0 {
+		if _, alive := readChunk(nil); !alive {
 			return false
 		}
+	}
+	if len(buf)-offset == 0 {
+		return true
 	}
 
 	nextSend := time.Now()
 	marker := true
-	for {
-		if s.stopped() || ctx.Err() != nil {
-			return false
-		}
-		if len(buf)-offset < config.FrameSamples && !closed {
-			waited := time.Now()
-			if !fillUntil(config.FrameSamples) {
-				return false
-			}
-			// チャンク待ちで時間が飛んだときは送信時刻を合わせ直す
-			if time.Since(waited) > config.FrameDuration {
-				nextSend = time.Now()
-			}
-		}
-		avail := len(buf) - offset
-		if avail == 0 {
-			if closed {
-				return true
-			}
-			continue
-		}
+	filling := false
+	silence := make([]byte, config.FrameSamples)
+	for i := range silence {
+		silence[i] = config.ULawSilence
+	}
 
-		frame := make([]byte, config.FrameSamples)
-		n := copy(frame, buf[offset:])
-		offset += n
-		for i := n; i < len(frame); i++ {
-			frame[i] = config.ULawSilence
-		}
-
+	sendFrame := func(frame []byte) bool {
 		if latest := s.getPeer(); latest != nil {
 			peer = latest
 		}
@@ -345,16 +377,95 @@ func (s *Session) sendStream(ctx context.Context, chunks <-chan []byte, prebuffe
 		s.txPackets.Add(1)
 		s.txBytes.Add(int64(len(frame)))
 		marker = false
-
 		nextSend = nextSend.Add(config.FrameDuration)
-		if wait := time.Until(nextSend); wait > 0 {
-			select {
-			case <-s.stop:
-				return false
-			case <-ctx.Done():
-				return false
-			case <-time.After(wait):
+		return true
+	}
+
+	pace := func() bool {
+		wait := time.Until(nextSend)
+		if wait <= 0 {
+			return true
+		}
+		timer := time.NewTimer(wait)
+		defer stopTimer(timer)
+		select {
+		case <-s.stop:
+			return false
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+
+	for {
+		if s.stopped() || ctx.Err() != nil {
+			return false
+		}
+		if !drain() {
+			return false
+		}
+
+		avail := len(buf) - offset
+		if avail < config.FrameSamples && !closed {
+			delay := time.Until(nextSend)
+			if delay < 0 {
+				delay = 0
 			}
+			timer := time.NewTimer(delay)
+			timedOut, alive := readChunk(timer)
+			stopTimer(timer)
+			if !alive {
+				return false
+			}
+			if !timedOut {
+				continue
+			}
+			if !drain() {
+				return false
+			}
+			avail = len(buf) - offset
+			if avail < config.FrameSamples {
+				frame := silence
+				if avail == 0 {
+					if !filling {
+						slog.Debug("RTP送出が音声を待っているため無音で時刻を維持")
+						filling = true
+					}
+				} else {
+					// 端数は次の断片を待たず、フレームの残りだけ無音にして送る。
+					frame = make([]byte, config.FrameSamples)
+					copy(frame, buf[offset:offset+avail])
+					for i := avail; i < len(frame); i++ {
+						frame[i] = config.ULawSilence
+					}
+					offset += avail
+					filling = false
+				}
+				if !sendFrame(frame) || !pace() {
+					return false
+				}
+				continue
+			}
+		}
+
+		if avail == 0 {
+			if closed {
+				return true
+			}
+			continue
+		}
+
+		n := min(avail, config.FrameSamples)
+		frame := make([]byte, config.FrameSamples)
+		copy(frame, buf[offset:offset+n])
+		for i := n; i < len(frame); i++ {
+			frame[i] = config.ULawSilence
+		}
+		offset += n
+		filling = false
+		if !sendFrame(frame) || !pace() {
+			return false
 		}
 	}
 }
