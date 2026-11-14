@@ -23,7 +23,8 @@ const (
 	// DefaultInstructions は音声と文字を交互に出し、日本語で答える指示。
 	DefaultInstructions = "Respond in interleaved text and audio. 日本語で答えてください。"
 	// DefaultPhoneInstructions は電話対話向けの指示。
-	DefaultPhoneInstructions = "電話の相手として、日本語で自然に答えてください。"
+	// 先頭の "Respond in text." が無いと、LFM3-Omni は返事をせず入力を繰り返す。
+	DefaultPhoneInstructions = "Respond in text. 電話の相手として、日本語で自然に答えてください。相手の言葉は繰り返さず、内容に答えてください。"
 
 	defaultInputRate  = 16000
 	defaultOutputRate = 24000
