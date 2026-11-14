@@ -4,30 +4,7 @@ package audio
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
-	"os"
 )
-
-// ReadWAV は PCM16 モノラルの WAV を読む。
-func ReadWAV(path string) ([]int16, int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, 0, fmt.Errorf("WAVを読めない: %w", err)
-	}
-	return DecodeWAV(data)
-}
-
-// WriteWAV は PCM16 モノラルの WAV を書く。
-func WriteWAV(path string, pcm []int16, sampleRate int) error {
-	if sampleRate <= 0 {
-		return errors.New("サンプルレートが不正です")
-	}
-	encoded := EncodeWAV(pcm, sampleRate)
-	if err := os.WriteFile(path, encoded, 0o644); err != nil {
-		return fmt.Errorf("WAVを書けない: %w", err)
-	}
-	return nil
-}
 
 // DecodeWAV は PCM16 モノラルの WAV バイト列をサンプルにする。
 func DecodeWAV(data []byte) ([]int16, int, error) {

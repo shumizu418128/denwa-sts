@@ -24,6 +24,9 @@ const (
 	rxQueueSize       = 512
 	utteranceQueue    = 4
 	streamChanSize    = 64
+	textChunkQueue    = 8
+	// toneLeadFrames は保留音を、RTP の 20ms 間隔より少し先まで溜める量。
+	toneLeadFrames = 3
 )
 
 var unusablePeerAddrs = map[string]bool{"": true, "0.0.0.0": true, "127.0.0.1": true, "::": true}
@@ -50,11 +53,19 @@ type Synthesizer interface {
 	SynthesizeULaw(text string) ([]byte, error)
 }
 
+// TextStreamer は返答テキストを、読み上げできる断片ができ次第 onChunk へ渡す。
+// 全文の生成完了より前に onChunk が呼ばれる。戻り値は返答全文。
+type TextStreamer interface {
+	StreamText(ctx context.Context, pcm []int16, sampleRate int, onChunk func(chunk string) error) (string, error)
+}
+
 // Options は通話ごとのセッションを作るための部品と設定。
 type Options struct {
 	ARI           ARI
 	DialResponder func(ctx context.Context) (Responder, error)
 	Synth         Synthesizer
+	// GreetingULaw は着信応答後に流す定型挨拶。暖機で作った μ-law をそのまま使う。
+	GreetingULaw []byte
 	// RTPBindHost は RTP を受ける UDP ソケットを開くアドレス。
 	RTPBindHost string
 	// FallbackPeerHost は ExternalMedia が使えないアドレスを返したときの RTP 送信先。
@@ -374,27 +385,49 @@ func (s *Session) respondOne(pcm []int16) {
 	}
 
 	started := time.Now()
+	play := s.openPlayback(turnCtx)
+	defer play.finish()
+
+	if streamer, ok := res.(TextStreamer); ok {
+		s.respondStreaming(turnCtx, streamer, pcm, started, play)
+		return
+	}
+	s.respondBuffered(turnCtx, res, pcm, started, play)
+}
+
+// utterancePlayback は保留音と応答音声を同じ RTP 列へ流す。
+type utterancePlayback struct {
+	ulawCh   chan []byte
+	sendDone <-chan bool
+	stopTone func()
+
+	finishOnce sync.Once
+	sentOK     bool
+}
+
+// openPlayback は RTP 送出と、最初の応答音声が来るまでの保留音を始める。
+func (s *Session) openPlayback(turnCtx context.Context) *utterancePlayback {
 	ulawCh := make(chan []byte, streamChanSize)
 	sendDone := make(chan bool, 1)
 	go func() {
 		sendDone <- s.rtp.SendULawStreamContext(turnCtx, ulawCh)
 	}()
 
-	// テキスト生成と音声合成が終わるまで「プップッ」という保留音を 20ms ごとに流す
 	stopTone := make(chan struct{})
 	toneDone := make(chan struct{})
-	stopThinkingTone := func() {
-		select {
-		case <-stopTone:
-		default:
-			close(stopTone)
-		}
-		<-toneDone
+	var stopOnce sync.Once
+	play := &utterancePlayback{
+		ulawCh:   ulawCh,
+		sendDone: sendDone,
+		stopTone: func() {
+			stopOnce.Do(func() { close(stopTone) })
+			<-toneDone
+		},
 	}
+	// 最初の応答音声まで「プップッ」という保留音を流す。
+	// 数フレーム先まで溜めて、送信側が空いた瞬間に無音を挟まないようにする。
 	go func() {
 		defer close(toneDone)
-		ticker := time.NewTicker(config.FrameDuration)
-		defer ticker.Stop()
 		for frameIdx := 0; ; frameIdx++ {
 			select {
 			case <-turnCtx.Done():
@@ -403,16 +436,34 @@ func (s *Session) respondOne(pcm []int16) {
 				return
 			case ulawCh <- audio.ThinkingToneFrame(frameIdx):
 			}
+			if len(ulawCh) < toneLeadFrames {
+				continue
+			}
+			timer := time.NewTimer(config.FrameDuration)
 			select {
 			case <-turnCtx.Done():
+				timer.Stop()
 				return
 			case <-stopTone:
+				timer.Stop()
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
 		}
 	}()
+	return play
+}
 
+func (p *utterancePlayback) finish() bool {
+	p.finishOnce.Do(func() {
+		p.stopTone()
+		close(p.ulawCh)
+		p.sentOK = <-p.sendDone
+	})
+	return p.sentOK
+}
+
+func (s *Session) respondBuffered(turnCtx context.Context, res Responder, pcm []int16, started time.Time, play *utterancePlayback) {
 	text, err := res.RespondText(turnCtx, pcm, config.SampleRate)
 	if err != nil && turnCtx.Err() == nil {
 		s.closeResponder()
@@ -421,9 +472,7 @@ func (s *Session) respondOne(pcm []int16) {
 		}
 	}
 	if err != nil {
-		stopThinkingTone()
-		close(ulawCh)
-		<-sendDone
+		play.finish()
 		s.closeResponder()
 		if turnCtx.Err() == nil {
 			slog.Error("STS応答失敗", "channel", s.channelID, "error", err)
@@ -434,40 +483,173 @@ func (s *Session) respondOne(pcm []int16) {
 	slog.Info("STSテキスト生成完了", "channel", s.channelID, "text", text, "text_elapsed", textElapsed)
 
 	if s.opts.Synth == nil {
-		stopThinkingTone()
-		close(ulawCh)
-		<-sendDone
+		play.finish()
 		slog.Error("Synthesizer が未設定です", "channel", s.channelID)
 		return
 	}
 	ulaw, err := s.opts.Synth.SynthesizeULaw(text)
-	stopThinkingTone()
+	play.stopTone()
 	if err != nil || turnCtx.Err() != nil {
-		close(ulawCh)
-		<-sendDone
+		play.finish()
 		if err != nil && turnCtx.Err() == nil {
-			slog.Error("VOICEVOX合成失敗", "channel", s.channelID, "text", text, "error", err)
+			slog.Error("音声合成失敗", "channel", s.channelID, "text", text, "error", err)
 		}
 		return
 	}
 	if len(ulaw) > 0 {
-		leadSilence := make([]byte, config.FrameSamples*5)
-		for i := range leadSilence {
-			leadSilence[i] = config.ULawSilence
-		}
-		select {
-		case <-turnCtx.Done():
-		case ulawCh <- leadSilence:
-		}
-		select {
-		case <-turnCtx.Done():
-		case ulawCh <- ulaw:
-		}
+		sendULawChunk(turnCtx, play.ulawCh, leadSilence())
+		sendULawChunk(turnCtx, play.ulawCh, ulaw)
 	}
-	close(ulawCh)
-	sentOK := <-sendDone
+	sentOK := play.finish()
 	slog.Info("STS応答完了", "channel", s.channelID, "text", text,
 		"bytes", len(ulaw), "sent_ok", sentOK, "interrupted", turnCtx.Err() != nil, "elapsed", time.Since(started).Round(10*time.Millisecond))
+}
+
+// respondStreaming はテキスト断片が揃い次第、全文の生成完了を待たずに音声合成と送出を始める。
+// 次の断片が再生に追いつかないあいだは、RTP 側が無音で送出時刻を保つ。
+func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreamer, pcm []int16, started time.Time, play *utterancePlayback) {
+	if s.opts.Synth == nil {
+		play.finish()
+		slog.Error("Synthesizer が未設定です", "channel", s.channelID)
+		return
+	}
+
+	streamCtx, streamCancel := context.WithCancel(turnCtx)
+	defer streamCancel()
+
+	chunks := make(chan string, textChunkQueue)
+	type synthResult struct {
+		err       error
+		bytes     int
+		abortText bool
+	}
+	synthCh := make(chan synthResult, 1)
+	textDone := make(chan struct{})
+
+	go func() {
+		var total int
+		var pending []byte
+		released := false
+		var result synthResult
+
+		flush := func() bool {
+			if len(pending) == 0 {
+				return true
+			}
+			if !released {
+				released = true
+				play.stopTone()
+				if !sendULawChunk(turnCtx, play.ulawCh, leadSilence()) {
+					result.err = turnCtx.Err()
+					return false
+				}
+			}
+			if !sendULawChunk(turnCtx, play.ulawCh, pending) {
+				result.err = turnCtx.Err()
+				return false
+			}
+			total += len(pending)
+			pending = nil
+			return true
+		}
+
+		for chunk := range chunks {
+			if streamCtx.Err() != nil {
+				result.err = streamCtx.Err()
+				break
+			}
+			ulaw, err := s.opts.Synth.SynthesizeULaw(chunk)
+			if err != nil {
+				result.err = err
+				select {
+				case <-textDone:
+				default:
+					result.abortText = true
+					streamCancel()
+				}
+				break
+			}
+			if len(ulaw) == 0 {
+				continue
+			}
+			pending = append(pending, ulaw...)
+			slog.Info("STS音声断片", "channel", s.channelID, "text", chunk, "bytes", len(ulaw), "elapsed", time.Since(started).Round(10*time.Millisecond))
+			if !flush() {
+				break
+			}
+		}
+		if len(pending) > 0 && !flush() && result.err == nil {
+			result.err = turnCtx.Err()
+		}
+		if !released {
+			play.stopTone()
+		}
+		result.bytes = total
+		synthCh <- result
+	}()
+
+	var emitted bool
+	onChunk := func(chunk string) error {
+		emitted = true
+		slog.Info("STSテキスト断片", "channel", s.channelID, "text", chunk, "elapsed", time.Since(started).Round(10*time.Millisecond))
+		select {
+		case <-streamCtx.Done():
+			return streamCtx.Err()
+		case chunks <- chunk:
+			return nil
+		}
+	}
+
+	text, err := streamer.StreamText(streamCtx, pcm, config.SampleRate, onChunk)
+	if err != nil && !emitted && turnCtx.Err() == nil && streamCtx.Err() == nil {
+		s.closeResponder()
+		if res2, dialErr := s.ensureResponder(); dialErr == nil {
+			if streamer2, ok := res2.(TextStreamer); ok {
+				text, err = streamer2.StreamText(streamCtx, pcm, config.SampleRate, onChunk)
+			}
+		}
+	}
+	close(textDone)
+	close(chunks)
+	result := <-synthCh
+	sentOK := play.finish()
+
+	if turnCtx.Err() == nil && result.abortText {
+		slog.Error("音声合成失敗", "channel", s.channelID, "text", text, "error", result.err)
+	} else if turnCtx.Err() == nil && err != nil {
+		slog.Error("STS応答失敗", "channel", s.channelID, "text", text, "error", err)
+	} else if turnCtx.Err() == nil && result.err != nil {
+		slog.Error("音声合成失敗", "channel", s.channelID, "text", text, "error", result.err)
+	}
+	if err != nil || result.abortText {
+		s.closeResponder()
+		return
+	}
+	if result.err != nil && turnCtx.Err() == nil {
+		return
+	}
+	slog.Info("STS応答完了", "channel", s.channelID, "text", text,
+		"bytes", result.bytes, "sent_ok", sentOK, "interrupted", turnCtx.Err() != nil, "elapsed", time.Since(started).Round(10*time.Millisecond))
+}
+
+func leadSilence() []byte {
+	lead := make([]byte, config.FrameSamples*5)
+	for i := range lead {
+		lead[i] = config.ULawSilence
+	}
+	return lead
+}
+
+func sendULawChunk(ctx context.Context, dst chan<- []byte, payload []byte) bool {
+	if len(payload) == 0 {
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case dst <- payload:
+		return true
+	}
 }
 
 // --- 通話の流れ ---
@@ -491,8 +673,21 @@ func (s *Session) run() {
 		}
 		return
 	}
+	s.playGreeting()
 	slog.Info("会話待機", "channel", s.channelID)
 	<-s.ctx.Done()
+}
+
+// playGreeting は暖機済みの挨拶を、通話の最初に1回流す。
+func (s *Session) playGreeting() {
+	greeting := s.opts.GreetingULaw
+	if len(greeting) == 0 || s.ctx.Err() != nil {
+		return
+	}
+	slog.Info("挨拶を送出", "channel", s.channelID, "bytes", len(greeting))
+	if !s.rtp.SendULawContext(s.ctx, greeting) && s.ctx.Err() == nil {
+		slog.Warn("挨拶の送出に失敗", "channel", s.channelID)
+	}
 }
 
 // setupMedia は応答し、ブリッジと ExternalMedia を作って、媒体が準備できたら ExternalMedia もブリッジへ入れる。

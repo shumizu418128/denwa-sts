@@ -5,7 +5,6 @@ ari.env
 
 # Go ビルド成果物
 /denwa-sts
-/sts
 *.exe
 *.exe~
 *.dll

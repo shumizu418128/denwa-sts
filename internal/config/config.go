@@ -30,7 +30,7 @@ const (
 	ULawSilence   = 0xFF
 )
 
-// --- VOICEVOX (読み上げ) ---
+// --- VOICEVOX (日本語の読み上げ) ---
 const (
 	VoicevoxDir         = "/home/denwa/voicevox"
 	VoicevoxVVMPath     = VoicevoxDir + "/0.vvm"
@@ -39,6 +39,14 @@ const (
 	VoicevoxStyleName   = "ノーマル"
 	VoicevoxVolume      = 1.0
 	VoicevoxCPUThreads  = 2
+)
+
+// --- Piper (英語の読み上げ) ---
+const (
+	PiperDir        = "/home/denwa/piper"
+	PiperPython     = PiperDir + "/.venv/bin/python"
+	PiperModelPath  = PiperDir + "/en_US-lessac-medium.onnx"
+	PiperCPUThreads = 2
 )
 
 // --- ログ ---
