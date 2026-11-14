@@ -503,8 +503,8 @@ func (s *Session) respondBuffered(turnCtx context.Context, res Responder, pcm []
 		"bytes", len(ulaw), "sent_ok", sentOK, "interrupted", turnCtx.Err() != nil, "elapsed", time.Since(started).Round(10*time.Millisecond))
 }
 
-// respondStreaming はテキスト断片が揃い次第、全文の生成完了を待たずに音声合成を始める。
-// 再生は2断片そろうか、生成が終わるまで始めない。最初の断片だけで流すと、次の合成が終わる前に RTP が空く。
+// respondStreaming はテキスト断片が揃い次第、全文の生成完了を待たずに音声合成と送出を始める。
+// 次の断片が再生に追いつかないあいだは、RTP 側が無音で送出時刻を保つ。
 func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreamer, pcm []int16, started time.Time, play *utterancePlayback) {
 	if s.opts.Synth == nil {
 		play.finish()
@@ -527,7 +527,6 @@ func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreame
 	go func() {
 		var total int
 		var pending []byte
-		var synthesized int
 		released := false
 		var result synthResult
 
@@ -572,12 +571,7 @@ func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreame
 				continue
 			}
 			pending = append(pending, ulaw...)
-			synthesized++
 			slog.Info("STS音声断片", "channel", s.channelID, "text", chunk, "bytes", len(ulaw), "elapsed", time.Since(started).Round(10*time.Millisecond))
-			// 最初の1断片は、次が合成できるまで保留音のまま持つ。
-			if !released && synthesized < 2 {
-				continue
-			}
 			if !flush() {
 				break
 			}

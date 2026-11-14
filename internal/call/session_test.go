@@ -1,6 +1,7 @@
 package call
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"sync"
@@ -354,4 +355,65 @@ func TestCallStartsSpeechBeforeTextDone(t *testing.T) {
 	if len(got) != 2 || got[0] != "前半です。" || got[1] != "後半です。" {
 		t.Fatalf("合成順=%q", got)
 	}
+}
+
+func TestCallPlaysFirstChunkBeforeTextDone(t *testing.T) {
+	const marker = 0x10
+	streamer := &scriptedStreamer{
+		chunks:      []string{"前半です。", "後半です。"},
+		startedRest: make(chan struct{}),
+		releaseRest: make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() { close(streamer.releaseRest) })
+	t.Cleanup(release)
+
+	received := make(chan []byte, 128)
+	peer, err := newLoopbackRTP(t, received)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := NewSession(Options{
+		ARI:              &fakeARI{},
+		DialResponder:    func(context.Context) (Responder, error) { return streamer, nil },
+		Synth:            markerSynth{marker: marker},
+		RTPBindHost:      "127.0.0.1",
+		FallbackPeerHost: "127.0.0.1",
+	}, "chan5", "200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Cleanup()
+	if err := session.rtp.SetPeer("127.0.0.1", peer); err != nil {
+		t.Fatal(err)
+	}
+	go session.respondLoop()
+	session.enqueueUtterance([]int16{1000, -1000, 500, -500})
+
+	select {
+	case <-streamer.startedRest:
+	case <-time.After(3 * time.Second):
+		t.Fatal("最初の断片が出ていない")
+	}
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case pkt := <-received:
+			if len(pkt) == config.FrameSamples && bytes.Count(pkt, []byte{marker}) == len(pkt) {
+				release()
+				return
+			}
+		case <-deadline:
+			t.Fatal("残りの文章が終わる前に最初の音声が流れない")
+		}
+	}
+}
+
+type markerSynth struct {
+	marker byte
+}
+
+func (s markerSynth) SynthesizeULaw(_ string) ([]byte, error) {
+	return bytes.Repeat([]byte{s.marker}, config.FrameSamples), nil
 }
