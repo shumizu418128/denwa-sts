@@ -27,7 +27,7 @@ const (
 	// DefaultModel は llama-server に渡すモデル名。実体は起動時の -hf で決まる。
 	DefaultModel = "gemma-4-e4b"
 	// DefaultPhoneInstructions は電話対話向けの指示。
-	DefaultPhoneInstructions = "You are on a phone call. Listen to the caller's audio and reply in plain spoken text only. Do not use markdown, bullet points, or special symbols. Do not repeat what the caller said; respond directly. Reply in the same language the caller just used, either Japanese or English. Your reply will be read aloud by a text-to-speech engine, so keep sentences short and natural for speech."
+	DefaultPhoneInstructions = "You are on a phone call. Listen to the caller's audio and reply in plain spoken text only. Do not use markdown, bullet points, or special symbols. Do not repeat what the caller said; respond directly. Reply in the same language the caller just used, either Japanese or English. Your reply will be read aloud by a text-to-speech engine, so keep sentences natural for speech."
 
 	defaultInputRate = 16000
 	// headerTimeout は応答ヘッダ待ち。本文ストリームは Client.Timeout せず context で打ち切る。
