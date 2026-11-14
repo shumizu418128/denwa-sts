@@ -1,4 +1,4 @@
-package lfm
+package segment
 
 import (
 	"strings"
@@ -6,7 +6,7 @@ import (
 )
 
 func feed(deltas ...string) []string {
-	var seg segmenter
+	var seg Segmenter
 	var out []string
 	for _, delta := range deltas {
 		out = append(out, seg.Push(delta)...)
@@ -17,7 +17,7 @@ func feed(deltas ...string) []string {
 
 func TestSegmenterSplitsOnSentenceAfterNextRune(t *testing.T) {
 	input := "こんにちは。明日は晴れです。"
-	var seg segmenter
+	var seg Segmenter
 	var got []string
 	emittedAt := -1
 	runes := []rune(input)
@@ -41,7 +41,7 @@ func TestSegmenterSplitsOnSentenceAfterNextRune(t *testing.T) {
 }
 
 func TestSegmenterHoldsClosingQuote(t *testing.T) {
-	var seg segmenter
+	var seg Segmenter
 	if parts := seg.Push("「はい。」"); len(parts) != 0 {
 		t.Fatalf("閉じ括弧を待たずに出した: %q", parts)
 	}
@@ -63,8 +63,8 @@ func TestSegmenterKeepsThousandsSeparator(t *testing.T) {
 }
 
 func TestSegmenterSplitsLongClauseAtComma(t *testing.T) {
-	head := strings.Repeat("あ", weakMinRunes)
-	var seg segmenter
+	head := strings.Repeat("あ", WeakMinRunes)
+	var seg Segmenter
 	if parts := seg.Push(head + "、"); len(parts) != 1 || parts[0] != head+"、" {
 		t.Fatalf("parts=%q", parts)
 	}
@@ -75,10 +75,10 @@ func TestSegmenterSplitsLongClauseAtComma(t *testing.T) {
 }
 
 func TestSegmenterForcesCutWithoutPunctuation(t *testing.T) {
-	var seg segmenter
-	body := strings.Repeat("あ", hardMaxRunes+8)
+	var seg Segmenter
+	body := strings.Repeat("あ", HardMaxRunes+8)
 	parts := seg.Push(body)
-	if len(parts) != 1 || len([]rune(parts[0])) != hardMaxRunes {
+	if len(parts) != 1 || len([]rune(parts[0])) != HardMaxRunes {
 		t.Fatalf("parts=%q", parts)
 	}
 	rest := seg.Flush()
@@ -95,7 +95,7 @@ func TestSegmenterFlushKeepsShortReply(t *testing.T) {
 }
 
 func TestSegmenterSplitsEnglishSentenceAfterNextRune(t *testing.T) {
-	var seg segmenter
+	var seg Segmenter
 	if parts := seg.Push("Hello."); len(parts) != 0 {
 		t.Fatalf("文末で確定していない: %q", parts)
 	}
@@ -125,7 +125,7 @@ func TestSegmenterKeepsDomainDot(t *testing.T) {
 
 func TestSegmenterCutsEnglishOnWordBoundary(t *testing.T) {
 	body := "Please hold while I look up your account details right now"
-	if len([]rune(body)) <= hardMaxRunes {
+	if len([]rune(body)) <= HardMaxRunes {
 		t.Fatalf("len=%d", len([]rune(body)))
 	}
 	got := feed(body)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"denwa-sts/internal/audio"
+	"denwa-sts/internal/segment"
 
 	"github.com/gorilla/websocket"
 )
@@ -200,7 +201,7 @@ func (s *Session) respond(ctx context.Context, pcm []int16, sampleRate int, onCh
 	}
 
 	var text strings.Builder
-	var seg segmenter
+	var seg segment.Segmenter
 	for {
 		event, err := readEvent(s.conn)
 		if err != nil {

@@ -7,6 +7,22 @@
 - 英語は Piper（`en_US-lessac-medium`）。モデルと仮想環境は `/home/denwa/piper/`
 - 返答の文字種で読み上げを切り替える
 - `llama-server` は別プロセスのまま。ここでは `denwa-sts` だけ更新する
+- モデルは **Gemma 4 E4B**（音声入力 → テキスト）。`denwa-sts` は `/v1/chat/completions` に `input_audio` を送る
+
+## llama-server（Gemma 4 E4B）
+
+LFM3 の `/v1/realtime` はやめ、音声対応の Gemma を chat completions で待つ。
+
+```bash
+# 例: ggml-org の GGUF（このリポは Q4_0 / Q8_0。Q4_K_M は無い）
+# CPU なら -ngl 0、-t はコア数に合わせる。mmproj は -hf が一緒に取る
+/home/denwa/sts/llama-b11960/llama-server \
+  -hf ggml-org/gemma-4-E4B-it-GGUF:Q4_0 \
+  --host 127.0.0.1 --port 8080 \
+  -c 8192 -t 6 --reasoning off
+```
+
+`denwa-sts` の既定は `http://127.0.0.1:8080/v1/chat/completions`。
 
 ## いちばん簡単（推奨）
 
