@@ -1,0 +1,444 @@
+// Package lfm は llama-server の /v1/realtime と音声対話を行う。
+package lfm
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"denwa-sts/internal/audio"
+
+	"github.com/gorilla/websocket"
+)
+
+const (
+	// DefaultServerURL は llama-server の既定の待ち受け。
+	DefaultServerURL = "ws://127.0.0.1:8080/v1/realtime"
+	// DefaultInstructions は音声と文字を交互に出し、日本語で答える指示。
+	DefaultInstructions = "Respond in interleaved text and audio. 日本語で答えてください。"
+	// DefaultPhoneInstructions は電話対話向けの指示。
+	DefaultPhoneInstructions = "電話の相手として、日本語で自然に答えてください。"
+
+	defaultInputRate  = 16000
+	defaultOutputRate = 24000
+	readLimit         = 32 << 20
+	dialTimeout       = 10 * time.Second
+)
+
+// Client は /v1/realtime への接続設定。
+type Client struct {
+	ServerURL    string
+	Instructions string
+}
+
+// Reply はモデルが返した文字と PCM16。
+type Reply struct {
+	Text       string
+	PCM        []int16
+	SampleRate int
+}
+
+// Session は 1 本の WebSocket で複数ターンの会話を行う。
+type Session struct {
+	conn    *websocket.Conn
+	inRate  int
+	outRate int
+
+	mu        sync.Mutex
+	closeOnce sync.Once
+	closed    bool
+}
+
+// Dial は /v1/realtime に接続し、session.created と session.update を完了した Session を返す。
+func (c Client) Dial(ctx context.Context) (*Session, error) {
+	serverURL := c.ServerURL
+	if serverURL == "" {
+		serverURL = DefaultServerURL
+	}
+	instructions := c.Instructions
+	if instructions == "" {
+		instructions = DefaultInstructions
+	}
+
+	dialer := websocket.Dialer{HandshakeTimeout: dialTimeout}
+	conn, _, err := dialer.DialContext(ctx, serverURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("realtimeへ接続できない: %w", err)
+	}
+	conn.SetReadLimit(readLimit)
+
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopWatch:
+		}
+	}()
+	stopWatching := func() {
+		close(stopWatch)
+		<-watchDone
+	}
+
+	created, err := readUntil(conn, "session.created")
+	if err != nil {
+		stopWatching()
+		_ = conn.Close()
+		return nil, err
+	}
+	inRate, outRate := ratesFromSession(created.Session)
+
+	if err := writeJSON(conn, map[string]any{
+		"type": "session.update",
+		"session": map[string]any{
+			"instructions":      instructions,
+			"output_modalities": []string{"text"},
+		},
+	}); err != nil {
+		stopWatching()
+		_ = conn.Close()
+		return nil, err
+	}
+	if _, err := readUntil(conn, "session.updated"); err != nil {
+		stopWatching()
+		_ = conn.Close()
+		return nil, err
+	}
+	stopWatching()
+
+	return &Session{
+		conn:    conn,
+		inRate:  inRate,
+		outRate: outRate,
+	}, nil
+}
+
+// InputRate はモデルが要求する入力サンプルレートを返す。
+func (s *Session) InputRate() int { return s.inRate }
+
+// OutputRate はモデルが出力する音声のサンプルレートを返す。
+func (s *Session) OutputRate() int { return s.outRate }
+
+// Close は WebSocket 接続を閉じる。何度呼んでもよい。
+func (s *Session) Close() {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		_ = s.conn.Close()
+	})
+}
+
+// RespondText は 1 発話分の PCM16 を送り、モデルが返したテキストを返す。
+func (s *Session) RespondText(ctx context.Context, pcm []int16, sampleRate int) (string, error) {
+	if len(pcm) == 0 {
+		return "", errors.New("音声が空です")
+	}
+	if sampleRate <= 0 {
+		return "", errors.New("サンプルレートが不正です")
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return "", errors.New("realtimeセッションは閉じている")
+	}
+	s.mu.Unlock()
+
+	resampled, err := audio.Resample(pcm, sampleRate, s.inRate)
+	if err != nil {
+		return "", err
+	}
+	if len(resampled) == 0 {
+		return "", errors.New("リサンプル後の音声が空です")
+	}
+
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ctx.Done():
+			s.Close()
+		case <-stopWatch:
+		}
+	}()
+	defer func() {
+		close(stopWatch)
+		<-watchDone
+	}()
+
+	if err := writeJSON(s.conn, map[string]any{"type": "input_audio_buffer.clear"}); err != nil {
+		return "", err
+	}
+	samplesPerChunk := int(time.Duration(s.inRate) * chunkDuration / time.Second)
+	if samplesPerChunk < 1 {
+		samplesPerChunk = 1
+	}
+	for start := 0; start < len(resampled); start += samplesPerChunk {
+		end := start + samplesPerChunk
+		if end > len(resampled) {
+			end = len(resampled)
+		}
+		payload := audio.PCM16Bytes(resampled[start:end])
+		if err := writeJSON(s.conn, map[string]any{
+			"type":  "input_audio_buffer.append",
+			"audio": base64.StdEncoding.EncodeToString(payload),
+		}); err != nil {
+			return "", err
+		}
+	}
+	if err := writeJSON(s.conn, map[string]any{"type": "input_audio_buffer.commit"}); err != nil {
+		return "", err
+	}
+	if err := writeJSON(s.conn, map[string]any{"type": "response.create"}); err != nil {
+		return "", err
+	}
+
+	var text strings.Builder
+	for {
+		event, err := readEvent(s.conn)
+		if err != nil {
+			return "", err
+		}
+		switch event.Type {
+		case "error":
+			message := "realtimeがエラーを返した"
+			if event.Error != nil && event.Error.Message != "" {
+				message = event.Error.Message
+			}
+			return "", errors.New(message)
+		case "response.output_text.delta":
+			if event.Delta != "" {
+				slog.Debug("モデルの文字", "text", event.Delta)
+				text.WriteString(event.Delta)
+			}
+		case "response.done":
+			if status := responseStatus(event.Response); status != "" && status != "completed" {
+				return "", fmt.Errorf("返事が完了していない: %s", status)
+			}
+			out := strings.TrimSpace(text.String())
+			if out == "" {
+				return "", errors.New("返事の文字がありません")
+			}
+			return out, nil
+		}
+	}
+}
+
+// Turn は pcm をモデルの入力レートに合わせ、返事の音声を返す。
+// ファイル全体が 1 ターンで、発話の区切りはしない。
+func (c Client) Turn(ctx context.Context, pcm []int16, sampleRate int) (Reply, error) {
+	if len(pcm) == 0 {
+		return Reply{}, errors.New("音声が空です")
+	}
+	if sampleRate <= 0 {
+		return Reply{}, errors.New("サンプルレートが不正です")
+	}
+	serverURL := c.ServerURL
+	if serverURL == "" {
+		serverURL = DefaultServerURL
+	}
+	instructions := c.Instructions
+	if instructions == "" {
+		instructions = DefaultInstructions
+	}
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, serverURL, nil)
+	if err != nil {
+		return Reply{}, fmt.Errorf("realtimeへ接続できない: %w", err)
+	}
+	defer conn.Close()
+	conn.SetReadLimit(readLimit)
+
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-stopWatch:
+		}
+	}()
+
+	created, err := readUntil(conn, "session.created")
+	if err != nil {
+		return Reply{}, err
+	}
+	inRate, outRate := ratesFromSession(created.Session)
+	resampled, err := audio.Resample(pcm, sampleRate, inRate)
+	if err != nil {
+		return Reply{}, err
+	}
+	if len(resampled) == 0 {
+		return Reply{}, errors.New("リサンプル後の音声が空です")
+	}
+
+	if err := writeJSON(conn, map[string]any{
+		"type": "session.update",
+		"session": map[string]any{
+			"instructions":      instructions,
+			"output_modalities": []string{"text", "audio"},
+		},
+	}); err != nil {
+		return Reply{}, err
+	}
+	samplesPerChunk := int(time.Duration(inRate) * chunkDuration / time.Second)
+	if samplesPerChunk < 1 {
+		samplesPerChunk = 1
+	}
+	for start := 0; start < len(resampled); start += samplesPerChunk {
+		end := start + samplesPerChunk
+		if end > len(resampled) {
+			end = len(resampled)
+		}
+		payload := audio.PCM16Bytes(resampled[start:end])
+		if err := writeJSON(conn, map[string]any{
+			"type":  "input_audio_buffer.append",
+			"audio": base64.StdEncoding.EncodeToString(payload),
+		}); err != nil {
+			return Reply{}, err
+		}
+	}
+	if err := writeJSON(conn, map[string]any{"type": "response.create"}); err != nil {
+		return Reply{}, err
+	}
+
+	var text strings.Builder
+	var reply []int16
+	for {
+		event, err := readEvent(conn)
+		if err != nil {
+			return Reply{}, err
+		}
+		switch event.Type {
+		case "error":
+			message := "realtimeがエラーを返した"
+			if event.Error != nil && event.Error.Message != "" {
+				message = event.Error.Message
+			}
+			return Reply{}, errors.New(message)
+		case "response.output_text.delta":
+			if event.Delta != "" {
+				slog.Info("モデルの文字", "text", event.Delta)
+				text.WriteString(event.Delta)
+			}
+		case "response.output_audio.delta":
+			raw, err := base64.StdEncoding.DecodeString(event.Delta)
+			if err != nil {
+				return Reply{}, fmt.Errorf("返事の音声を復号できない: %w", err)
+			}
+			samples, err := audio.PCM16FromBytes(audio.EvenBytes(raw))
+			if err != nil {
+				return Reply{}, err
+			}
+			reply = append(reply, samples...)
+		case "response.done":
+			if status := responseStatus(event.Response); status != "" && status != "completed" {
+				return Reply{}, fmt.Errorf("返事が完了していない: %s", status)
+			}
+			if len(reply) == 0 {
+				return Reply{}, errors.New("返事の音声がありません")
+			}
+			return Reply{Text: text.String(), PCM: reply, SampleRate: outRate}, nil
+		}
+	}
+}
+
+type incoming struct {
+	Type     string          `json:"type"`
+	Delta    string          `json:"delta"`
+	Session  json.RawMessage `json:"session"`
+	Response json.RawMessage `json:"response"`
+	Error    *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func readUntil(conn *websocket.Conn, want string) (incoming, error) {
+	for {
+		event, err := readEvent(conn)
+		if err != nil {
+			return incoming{}, err
+		}
+		if event.Type == "error" {
+			message := "realtimeがエラーを返した"
+			if event.Error != nil && event.Error.Message != "" {
+				message = event.Error.Message
+			}
+			return incoming{}, errors.New(message)
+		}
+		if event.Type == want {
+			return event, nil
+		}
+	}
+}
+
+func readEvent(conn *websocket.Conn) (incoming, error) {
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		return incoming{}, fmt.Errorf("realtimeの受信に失敗した: %w", err)
+	}
+	var event incoming
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return incoming{}, fmt.Errorf("realtimeのJSONを読めない: %w", err)
+	}
+	return event, nil
+}
+
+func writeJSON(conn *websocket.Conn, value any) error {
+	if err := conn.WriteJSON(value); err != nil {
+		return fmt.Errorf("realtimeへ送信できない: %w", err)
+	}
+	return nil
+}
+
+func ratesFromSession(raw json.RawMessage) (int, int) {
+	inRate := defaultInputRate
+	outRate := defaultOutputRate
+	var session struct {
+		Audio struct {
+			Input struct {
+				Format struct {
+					Rate int `json:"rate"`
+				} `json:"format"`
+			} `json:"input"`
+			Output struct {
+				Format struct {
+					Rate int `json:"rate"`
+				} `json:"format"`
+			} `json:"output"`
+		} `json:"audio"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &session) != nil {
+		return inRate, outRate
+	}
+	if session.Audio.Input.Format.Rate > 0 {
+		inRate = session.Audio.Input.Format.Rate
+	}
+	if session.Audio.Output.Format.Rate > 0 {
+		outRate = session.Audio.Output.Format.Rate
+	}
+	return inRate, outRate
+}
+
+func responseStatus(raw json.RawMessage) string {
+	var response struct {
+		Status string `json:"status"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &response) != nil {
+		return ""
+	}
+	return response.Status
+}
+
+// chunkDuration は 1 回の append の長さ。約 100 ms。
+const chunkDuration = 100 * time.Millisecond

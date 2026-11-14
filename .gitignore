@@ -1,0 +1,29 @@
+# 認証・環境設定（リポジトリ外で管理）
+ari.env
+.env
+.env.*
+
+# Go ビルド成果物
+/denwa-sts
+/sts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# 依存・キャッシュ
+/vendor/
+
+# ログ・実行時データ
+*.log
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
