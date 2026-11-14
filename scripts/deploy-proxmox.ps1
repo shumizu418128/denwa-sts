@@ -70,7 +70,7 @@ try {
 	Assert-LastExit "リモート作業ディレクトリの作成"
 
 	# .git と Windows のビルド成果物を除く。pax 拡張ヘッダを避けるため ustar で作る。
-	# denwa-sts や sts という名前では除外しない。cmd/denwa-sts まで落ちる。
+	# denwa-sts という名前では除外しない。cmd/denwa-sts まで落ちる。
 	tar --format=ustar -cf $Archive `
 		--exclude=.git `
 		--exclude=*.exe `

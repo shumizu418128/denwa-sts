@@ -58,7 +58,3 @@ ssh proxmox "pgrep -a denwa-sts; tail -n 20 /home/denwa/sts/denwa_sts.log"
 ```
 
 `起動 app=denwa_sts` と `VOICEVOX暖機完了` が出ていればよい。
-
-## 補助 CLI `sts` だけ更新したい場合
-
-同じ CGO 設定で `go build -o sts ./cmd/sts` し、`/home/denwa/sts/sts` に `install` する（常駐プロセスはないので再起動は不要）。

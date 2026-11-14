@@ -20,14 +20,11 @@ import (
 const (
 	// DefaultServerURL は llama-server の既定の待ち受け。
 	DefaultServerURL = "ws://127.0.0.1:8080/v1/realtime"
-	// DefaultInstructions は音声と文字を交互に出し、日本語で答える指示。
-	DefaultInstructions = "Respond in interleaved text and audio. 日本語で答えてください。"
 	// DefaultPhoneInstructions は電話対話向けの指示。
 	// 先頭の "Respond in text." が無いと、LFM3-Omni は返事をせず入力を繰り返す。
 	DefaultPhoneInstructions = "Respond in text. 電話の相手として、日本語で自然に答えてください。相手の言葉は繰り返さず、内容に答えてください。"
 
-	defaultInputRate  = 16000
-	defaultOutputRate = 24000
+	defaultInputRate = 16000
 	readLimit         = 32 << 20
 	dialTimeout       = 10 * time.Second
 )
@@ -38,18 +35,10 @@ type Client struct {
 	Instructions string
 }
 
-// Reply はモデルが返した文字と PCM16。
-type Reply struct {
-	Text       string
-	PCM        []int16
-	SampleRate int
-}
-
 // Session は 1 本の WebSocket で複数ターンの会話を行う。
 type Session struct {
-	conn    *websocket.Conn
-	inRate  int
-	outRate int
+	conn   *websocket.Conn
+	inRate int
 
 	mu        sync.Mutex
 	closeOnce sync.Once
@@ -64,7 +53,7 @@ func (c Client) Dial(ctx context.Context) (*Session, error) {
 	}
 	instructions := c.Instructions
 	if instructions == "" {
-		instructions = DefaultInstructions
+		instructions = DefaultPhoneInstructions
 	}
 
 	dialer := websocket.Dialer{HandshakeTimeout: dialTimeout}
@@ -95,7 +84,7 @@ func (c Client) Dial(ctx context.Context) (*Session, error) {
 		_ = conn.Close()
 		return nil, err
 	}
-	inRate, outRate := ratesFromSession(created.Session)
+	inRate := ratesFromSession(created.Session)
 
 	if err := writeJSON(conn, map[string]any{
 		"type": "session.update",
@@ -116,17 +105,10 @@ func (c Client) Dial(ctx context.Context) (*Session, error) {
 	stopWatching()
 
 	return &Session{
-		conn:    conn,
-		inRate:  inRate,
-		outRate: outRate,
+		conn:   conn,
+		inRate: inRate,
 	}, nil
 }
-
-// InputRate はモデルが要求する入力サンプルレートを返す。
-func (s *Session) InputRate() int { return s.inRate }
-
-// OutputRate はモデルが出力する音声のサンプルレートを返す。
-func (s *Session) OutputRate() int { return s.outRate }
 
 // Close は WebSocket 接続を閉じる。何度呼んでもよい。
 func (s *Session) Close() {
@@ -276,125 +258,6 @@ func emitChunks(onChunk func(string) error, chunks []string) error {
 	return nil
 }
 
-// Turn は pcm をモデルの入力レートに合わせ、返事の音声を返す。
-// ファイル全体が 1 ターンで、発話の区切りはしない。
-func (c Client) Turn(ctx context.Context, pcm []int16, sampleRate int) (Reply, error) {
-	if len(pcm) == 0 {
-		return Reply{}, errors.New("音声が空です")
-	}
-	if sampleRate <= 0 {
-		return Reply{}, errors.New("サンプルレートが不正です")
-	}
-	serverURL := c.ServerURL
-	if serverURL == "" {
-		serverURL = DefaultServerURL
-	}
-	instructions := c.Instructions
-	if instructions == "" {
-		instructions = DefaultInstructions
-	}
-
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, serverURL, nil)
-	if err != nil {
-		return Reply{}, fmt.Errorf("realtimeへ接続できない: %w", err)
-	}
-	defer conn.Close()
-	conn.SetReadLimit(readLimit)
-
-	stopWatch := make(chan struct{})
-	defer close(stopWatch)
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-stopWatch:
-		}
-	}()
-
-	created, err := readUntil(conn, "session.created")
-	if err != nil {
-		return Reply{}, err
-	}
-	inRate, outRate := ratesFromSession(created.Session)
-	resampled, err := audio.Resample(pcm, sampleRate, inRate)
-	if err != nil {
-		return Reply{}, err
-	}
-	if len(resampled) == 0 {
-		return Reply{}, errors.New("リサンプル後の音声が空です")
-	}
-
-	if err := writeJSON(conn, map[string]any{
-		"type": "session.update",
-		"session": map[string]any{
-			"instructions":      instructions,
-			"output_modalities": []string{"text", "audio"},
-		},
-	}); err != nil {
-		return Reply{}, err
-	}
-	samplesPerChunk := int(time.Duration(inRate) * chunkDuration / time.Second)
-	if samplesPerChunk < 1 {
-		samplesPerChunk = 1
-	}
-	for start := 0; start < len(resampled); start += samplesPerChunk {
-		end := start + samplesPerChunk
-		if end > len(resampled) {
-			end = len(resampled)
-		}
-		payload := audio.PCM16Bytes(resampled[start:end])
-		if err := writeJSON(conn, map[string]any{
-			"type":  "input_audio_buffer.append",
-			"audio": base64.StdEncoding.EncodeToString(payload),
-		}); err != nil {
-			return Reply{}, err
-		}
-	}
-	if err := writeJSON(conn, map[string]any{"type": "response.create"}); err != nil {
-		return Reply{}, err
-	}
-
-	var text strings.Builder
-	var reply []int16
-	for {
-		event, err := readEvent(conn)
-		if err != nil {
-			return Reply{}, err
-		}
-		switch event.Type {
-		case "error":
-			message := "realtimeがエラーを返した"
-			if event.Error != nil && event.Error.Message != "" {
-				message = event.Error.Message
-			}
-			return Reply{}, errors.New(message)
-		case "response.output_text.delta":
-			if event.Delta != "" {
-				slog.Info("モデルの文字", "text", event.Delta)
-				text.WriteString(event.Delta)
-			}
-		case "response.output_audio.delta":
-			raw, err := base64.StdEncoding.DecodeString(event.Delta)
-			if err != nil {
-				return Reply{}, fmt.Errorf("返事の音声を復号できない: %w", err)
-			}
-			samples, err := audio.PCM16FromBytes(audio.EvenBytes(raw))
-			if err != nil {
-				return Reply{}, err
-			}
-			reply = append(reply, samples...)
-		case "response.done":
-			if status := responseStatus(event.Response); status != "" && status != "completed" {
-				return Reply{}, fmt.Errorf("返事が完了していない: %s", status)
-			}
-			if len(reply) == 0 {
-				return Reply{}, errors.New("返事の音声がありません")
-			}
-			return Reply{Text: text.String(), PCM: reply, SampleRate: outRate}, nil
-		}
-	}
-}
-
 type incoming struct {
 	Type     string          `json:"type"`
 	Delta    string          `json:"delta"`
@@ -443,9 +306,8 @@ func writeJSON(conn *websocket.Conn, value any) error {
 	return nil
 }
 
-func ratesFromSession(raw json.RawMessage) (int, int) {
+func ratesFromSession(raw json.RawMessage) int {
 	inRate := defaultInputRate
-	outRate := defaultOutputRate
 	var session struct {
 		Audio struct {
 			Input struct {
@@ -453,23 +315,15 @@ func ratesFromSession(raw json.RawMessage) (int, int) {
 					Rate int `json:"rate"`
 				} `json:"format"`
 			} `json:"input"`
-			Output struct {
-				Format struct {
-					Rate int `json:"rate"`
-				} `json:"format"`
-			} `json:"output"`
 		} `json:"audio"`
 	}
 	if len(raw) == 0 || json.Unmarshal(raw, &session) != nil {
-		return inRate, outRate
+		return inRate
 	}
 	if session.Audio.Input.Format.Rate > 0 {
 		inRate = session.Audio.Input.Format.Rate
 	}
-	if session.Audio.Output.Format.Rate > 0 {
-		outRate = session.Audio.Output.Format.Rate
-	}
-	return inRate, outRate
+	return inRate
 }
 
 func responseStatus(raw json.RawMessage) string {

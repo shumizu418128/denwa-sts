@@ -3,17 +3,12 @@ package audio
 import (
 	"bytes"
 	"math"
-	"path/filepath"
 	"testing"
 )
 
 func TestWAVRoundTrip(t *testing.T) {
 	pcm := []int16{0, 1000, -1000, 32767, -32768}
-	path := filepath.Join(t.TempDir(), "tone.wav")
-	if err := WriteWAV(path, pcm, 16000); err != nil {
-		t.Fatal(err)
-	}
-	got, rate, err := ReadWAV(path)
+	got, rate, err := DecodeWAV(EncodeWAV(pcm, 16000))
 	if err != nil {
 		t.Fatal(err)
 	}
