@@ -22,7 +22,7 @@ const (
 	DefaultServerURL = "ws://127.0.0.1:8080/v1/realtime"
 	// DefaultPhoneInstructions は電話対話向けの指示。
 	// 先頭の "Respond in text." が無いと、LFM3-Omni は返事をせず入力を繰り返す。
-	DefaultPhoneInstructions = "Respond in text. 電話の相手として、日本語で自然に答えてください。相手の言葉は繰り返さず、内容に答えてください。"
+	DefaultPhoneInstructions = "Respond in text. 電話の相手として、日本語で自然に答えてください。相手の言葉は繰り返さず、内容に答えてください。あなたの回答は音声読み上げエンジンによって読み上げられるので、読み上げやすいテキストを生成すること。"
 
 	defaultInputRate = 16000
 	readLimit         = 32 << 20
