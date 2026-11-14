@@ -93,3 +93,46 @@ func TestSegmenterFlushKeepsShortReply(t *testing.T) {
 		t.Fatalf("got=%q", got)
 	}
 }
+
+func TestSegmenterSplitsEnglishSentenceAfterNextRune(t *testing.T) {
+	var seg segmenter
+	if parts := seg.Push("Hello."); len(parts) != 0 {
+		t.Fatalf("文末で確定していない: %q", parts)
+	}
+	parts := seg.Push(" How are you?")
+	if len(parts) != 1 || parts[0] != "Hello." {
+		t.Fatalf("parts=%q", parts)
+	}
+	rest := seg.Flush()
+	if len(rest) != 1 || rest[0] != "How are you?" {
+		t.Fatalf("flush=%q", rest)
+	}
+}
+
+func TestSegmenterKeepsDecimalPoint(t *testing.T) {
+	got := feed("It costs 3.14 dollars.")
+	if len(got) != 1 || got[0] != "It costs 3.14 dollars." {
+		t.Fatalf("got=%q", got)
+	}
+}
+
+func TestSegmenterKeepsDomainDot(t *testing.T) {
+	got := feed("See example.com today.")
+	if len(got) != 1 || got[0] != "See example.com today." {
+		t.Fatalf("got=%q", got)
+	}
+}
+
+func TestSegmenterCutsEnglishOnWordBoundary(t *testing.T) {
+	body := "Please hold while I look up your account details right now"
+	if len([]rune(body)) <= hardMaxRunes {
+		t.Fatalf("len=%d", len([]rune(body)))
+	}
+	got := feed(body)
+	if len(got) < 2 {
+		t.Fatalf("got=%q", got)
+	}
+	if strings.Join(got, " ") != body {
+		t.Fatalf("joined=%q parts=%q", strings.Join(got, " "), got)
+	}
+}

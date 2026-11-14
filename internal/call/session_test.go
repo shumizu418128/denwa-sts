@@ -3,6 +3,7 @@ package call
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -145,6 +146,58 @@ func TestCallLifecycle(t *testing.T) {
 	calls = pbx.snapshot()
 	if !contains(calls, "hangup extmedia-chan1") || !contains(calls, "destroyBridge br1") {
 		t.Errorf("後始末されていない: %v", calls)
+	}
+}
+
+type portARI struct {
+	fakeARI
+	port string
+}
+
+func (p *portARI) CreateExternalMedia(_ context.Context, _, id string) (*ari.Channel, error) {
+	p.record("externalMedia " + id)
+	return &ari.Channel{ID: id, ChannelVars: map[string]string{
+		"UNICASTRTP_LOCAL_ADDRESS": "0.0.0.0",
+		"UNICASTRTP_LOCAL_PORT":    p.port,
+	}}, nil
+}
+
+func TestCallPlaysWarmupGreeting(t *testing.T) {
+	const marker = 0x21
+	greeting := bytes.Repeat([]byte{marker}, config.FrameSamples*2)
+
+	received := make(chan []byte, 16)
+	peer, err := newLoopbackRTP(t, received)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := NewSession(Options{
+		ARI:              &portARI{port: strconv.Itoa(peer)},
+		DialResponder:    func(context.Context) (Responder, error) { return &fakeResponder{}, nil },
+		GreetingULaw:     greeting,
+		RTPBindHost:      "127.0.0.1",
+		FallbackPeerHost: "127.0.0.1",
+	}, "chan-hello", "100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Cleanup()
+	session.Start()
+	session.NotifyMediaReady()
+
+	var got int
+	deadline := time.After(3 * time.Second)
+	for got < 2 {
+		select {
+		case pkt := <-received:
+			if len(pkt) != config.FrameSamples || bytes.Count(pkt, []byte{marker}) != len(pkt) {
+				t.Fatalf("挨拶と違うパケット len=%d", len(pkt))
+			}
+			got++
+		case <-deadline:
+			t.Fatalf("挨拶が %d フレームしか届かない", got)
+		}
 	}
 }
 

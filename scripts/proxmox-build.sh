@@ -11,6 +11,8 @@ export CGO_ENABLED=1
 export CGO_CFLAGS="-I${HOME}/voicevox/core/include"
 export CGO_LDFLAGS="-L${HOME}/voicevox/core/lib -Wl,-rpath,${HOME}/voicevox/core/lib"
 
+bash "${ROOT}/scripts/setup-piper.sh"
+
 cd "${ROOT}"
 go test ./...
 go build -o denwa-sts ./cmd/denwa-sts

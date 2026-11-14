@@ -70,7 +70,7 @@ func nextCut(buf []rune, final bool) int {
 	}
 	lastWeak := 0
 	for i := range buf {
-		strong := isStrongBreak(buf[i])
+		strong := isStrongBreak(buf, i)
 		weak := isWeakBreak(buf, i)
 		if !strong && !weak {
 			continue
@@ -107,10 +107,24 @@ func forcedCut(buf []rune, lastWeak int) int {
 	if lastWeak >= 4 && lastWeak <= hardMaxRunes && speakableRunes(buf[:lastWeak]) >= 4 {
 		return lastWeak
 	}
-	if hardMaxRunes < len(buf) {
-		return hardMaxRunes
+	cut := hardMaxRunes
+	if cut > len(buf) {
+		cut = len(buf)
 	}
-	return len(buf)
+	// 英語は空白の位置で切り、単語の途中で読ませない。
+	if space := lastBreakSpace(buf[:cut]); space >= 4 {
+		return space
+	}
+	return cut
+}
+
+func lastBreakSpace(buf []rune) int {
+	for i := len(buf) - 1; i >= 0; i-- {
+		if unicode.IsSpace(buf[i]) {
+			return i
+		}
+	}
+	return 0
 }
 
 func absorbClosers(buf []rune, i int) int {
@@ -130,10 +144,20 @@ func speakableRunes(buf []rune) int {
 	return n
 }
 
-func isStrongBreak(r rune) bool {
-	switch r {
+func isStrongBreak(buf []rune, i int) bool {
+	switch buf[i] {
 	case '。', '！', '？', '!', '?', '…', '．', '\n', '\r':
 		return true
+	case '.':
+		// 小数点や example.com のドットでは切らない。文末のピリオドは次の文字が来るまで保留する。
+		if i > 0 && isDigit(buf[i-1]) && (i+1 == len(buf) || isDigit(buf[i+1])) {
+			return false
+		}
+		if i+1 == len(buf) {
+			return true
+		}
+		next := buf[i+1]
+		return unicode.IsSpace(next) || isCloser(next)
 	default:
 		return false
 	}

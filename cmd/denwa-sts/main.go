@@ -1,9 +1,11 @@
-// Command denwa-sts は ARI の着信音声を VAD で区切り、LFM3-Omni で返答テキストを生成して VOICEVOX で読み上げる。
+// Command denwa-sts は ARI の着信音声を VAD で区切り、LFM3-Omni で返答テキストを生成して読み上げる。
+// 日本語はずんだもん、英語は Piper。
 //
 // 起動: /home/denwa/sts/denwa-sts
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -17,7 +19,7 @@ import (
 	"denwa-sts/internal/call"
 	"denwa-sts/internal/config"
 	"denwa-sts/internal/lfm"
-	"denwa-sts/internal/voicevox"
+	"denwa-sts/internal/synth"
 )
 
 func main() {
@@ -42,16 +44,26 @@ func run() error {
 		return err
 	}
 
-	synth, err := voicevox.Load()
+	engine, err := synth.Load()
 	if err != nil {
 		return err
 	}
-	defer synth.Close()
-	slog.Info("VOICEVOX暖機")
-	if _, err := synth.SynthesizeULaw("こんにちは"); err != nil {
-		return fmt.Errorf("暖機失敗: %w", err)
+	defer engine.Close()
+	slog.Info("読み上げ暖機")
+	japanese, err := engine.SynthesizeULaw("こんにちは")
+	if err != nil {
+		return fmt.Errorf("日本語の暖機失敗: %w", err)
 	}
-	slog.Info("VOICEVOX暖機完了")
+	english, err := engine.SynthesizeULaw("Hello.")
+	if err != nil {
+		return fmt.Errorf("英語の暖機失敗: %w", err)
+	}
+	if len(japanese) == 0 || len(english) == 0 {
+		return fmt.Errorf("暖機失敗: 挨拶の音声が空です")
+	}
+	gap := bytes.Repeat([]byte{config.ULawSilence}, config.FrameSamples*8)
+	greeting := append(append(japanese, gap...), english...)
+	slog.Info("読み上げ暖機完了", "ja_bytes", len(japanese), "en_bytes", len(english))
 
 	client := lfm.Client{
 		ServerURL:    *server,
@@ -66,7 +78,8 @@ func run() error {
 		DialResponder: func(ctx context.Context) (call.Responder, error) {
 			return client.Dial(ctx)
 		},
-		Synth:            synth,
+		Synth:            engine,
+		GreetingULaw:     greeting,
 		RTPBindHost:      config.RTPBindHost,
 		FallbackPeerHost: config.ARIHost,
 	})

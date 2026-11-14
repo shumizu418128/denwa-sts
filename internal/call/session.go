@@ -64,6 +64,8 @@ type Options struct {
 	ARI           ARI
 	DialResponder func(ctx context.Context) (Responder, error)
 	Synth         Synthesizer
+	// GreetingULaw は着信応答後に流す定型挨拶。暖機で作った μ-law をそのまま使う。
+	GreetingULaw []byte
 	// RTPBindHost は RTP を受ける UDP ソケットを開くアドレス。
 	RTPBindHost string
 	// FallbackPeerHost は ExternalMedia が使えないアドレスを返したときの RTP 送信先。
@@ -490,7 +492,7 @@ func (s *Session) respondBuffered(turnCtx context.Context, res Responder, pcm []
 	if err != nil || turnCtx.Err() != nil {
 		play.finish()
 		if err != nil && turnCtx.Err() == nil {
-			slog.Error("VOICEVOX合成失敗", "channel", s.channelID, "text", text, "error", err)
+			slog.Error("音声合成失敗", "channel", s.channelID, "text", text, "error", err)
 		}
 		return
 	}
@@ -613,11 +615,11 @@ func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreame
 	sentOK := play.finish()
 
 	if turnCtx.Err() == nil && result.abortText {
-		slog.Error("VOICEVOX合成失敗", "channel", s.channelID, "text", text, "error", result.err)
+		slog.Error("音声合成失敗", "channel", s.channelID, "text", text, "error", result.err)
 	} else if turnCtx.Err() == nil && err != nil {
 		slog.Error("STS応答失敗", "channel", s.channelID, "text", text, "error", err)
 	} else if turnCtx.Err() == nil && result.err != nil {
-		slog.Error("VOICEVOX合成失敗", "channel", s.channelID, "text", text, "error", result.err)
+		slog.Error("音声合成失敗", "channel", s.channelID, "text", text, "error", result.err)
 	}
 	if err != nil || result.abortText {
 		s.closeResponder()
@@ -671,8 +673,21 @@ func (s *Session) run() {
 		}
 		return
 	}
+	s.playGreeting()
 	slog.Info("会話待機", "channel", s.channelID)
 	<-s.ctx.Done()
+}
+
+// playGreeting は暖機済みの挨拶を、通話の最初に1回流す。
+func (s *Session) playGreeting() {
+	greeting := s.opts.GreetingULaw
+	if len(greeting) == 0 || s.ctx.Err() != nil {
+		return
+	}
+	slog.Info("挨拶を送出", "channel", s.channelID, "bytes", len(greeting))
+	if !s.rtp.SendULawContext(s.ctx, greeting) && s.ctx.Err() == nil {
+		slog.Warn("挨拶の送出に失敗", "channel", s.channelID)
+	}
 }
 
 // setupMedia は応答し、ブリッジと ExternalMedia を作って、媒体が準備できたら ExternalMedia もブリッジへ入れる。

@@ -22,11 +22,11 @@ const (
 	DefaultServerURL = "ws://127.0.0.1:8080/v1/realtime"
 	// DefaultPhoneInstructions は電話対話向けの指示。
 	// 先頭の "Respond in text." が無いと、LFM3-Omni は返事をせず入力を繰り返す。
-	DefaultPhoneInstructions = "Respond in text. Speak naturally, as if you were the other person on a phone call. Do not repeat what the other person says; respond directly to the content. Always speak Japanese. Your responses will be read aloud by a text-to-speech engine, so generate text that sounds natural when spoken."
+	DefaultPhoneInstructions = "Respond in text. Speak naturally, as if you were the other person on a phone call. Do not repeat what the other person says; respond directly to the content. Reply in the same language the caller just used, either Japanese or English. Your responses will be read aloud by a text-to-speech engine, so generate text that sounds natural when spoken."
 
 	defaultInputRate = 16000
-	readLimit         = 32 << 20
-	dialTimeout       = 10 * time.Second
+	readLimit        = 32 << 20
+	dialTimeout      = 10 * time.Second
 )
 
 // Client は /v1/realtime への接続設定。
