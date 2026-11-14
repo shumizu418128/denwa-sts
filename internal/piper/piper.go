@@ -142,7 +142,7 @@ func (c *Client) ensureLocked() error {
 
 func (c *Client) startLocked() error {
 	cmd := exec.Command(c.python, "-u", c.script, "--model", c.model, "--threads", fmt.Sprintf("%d", c.threads))
-	cmd.Env = append(os.Environ(), "ORT_DISABLE_TELEMETRY=1", "PYTHONUNBUFFERED=1")
+	cmd.Env = append(os.Environ(), "ORT_DISABLE_TELEMETRY=1", "PYTHONUNBUFFERED=1", "PYTHONSAFEPATH=1")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
