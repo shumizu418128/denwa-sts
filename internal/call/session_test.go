@@ -2,6 +2,7 @@ package call
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -235,4 +236,122 @@ func TestCallBargeInInterruptsPlayback(t *testing.T) {
 	}
 }
 
+type scriptedStreamer struct {
+	chunks      []string
+	startedRest chan struct{}
+	releaseRest chan struct{}
+}
 
+func (s *scriptedStreamer) RespondText(context.Context, []int16, int) (string, error) {
+	return "", nil
+}
+
+func (s *scriptedStreamer) Close() {}
+
+func (s *scriptedStreamer) StreamText(ctx context.Context, _ []int16, _ int, onChunk func(string) error) (string, error) {
+	var b strings.Builder
+	for i, chunk := range s.chunks {
+		if err := onChunk(chunk); err != nil {
+			return b.String(), err
+		}
+		b.WriteString(chunk)
+		if i == 0 {
+			close(s.startedRest)
+			select {
+			case <-ctx.Done():
+				return b.String(), ctx.Err()
+			case <-s.releaseRest:
+			}
+		}
+	}
+	return b.String(), nil
+}
+
+type gateSynth struct {
+	mu           sync.Mutex
+	texts        []string
+	firstStarted chan struct{}
+	holdFirst    chan struct{}
+}
+
+func (g *gateSynth) SynthesizeULaw(text string) ([]byte, error) {
+	g.mu.Lock()
+	g.texts = append(g.texts, text)
+	n := len(g.texts)
+	g.mu.Unlock()
+	if n == 1 {
+		close(g.firstStarted)
+		<-g.holdFirst
+	}
+	return make([]byte, config.FrameSamples), nil
+}
+
+func (g *gateSynth) snapshot() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.texts...)
+}
+
+func TestCallStartsSpeechBeforeTextDone(t *testing.T) {
+	streamer := &scriptedStreamer{
+		chunks:      []string{"前半です。", "後半です。"},
+		startedRest: make(chan struct{}),
+		releaseRest: make(chan struct{}),
+	}
+	synth := &gateSynth{
+		firstStarted: make(chan struct{}),
+		holdFirst:    make(chan struct{}),
+	}
+	release := sync.OnceFunc(func() {
+		close(synth.holdFirst)
+		close(streamer.releaseRest)
+	})
+	t.Cleanup(release)
+
+	received := make(chan []byte, 128)
+	peer, err := newLoopbackRTP(t, received)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := NewSession(Options{
+		ARI:              &fakeARI{},
+		DialResponder:    func(context.Context) (Responder, error) { return streamer, nil },
+		Synth:            synth,
+		RTPBindHost:      "127.0.0.1",
+		FallbackPeerHost: "127.0.0.1",
+	}, "chan4", "200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Cleanup()
+	if err := session.rtp.SetPeer("127.0.0.1", peer); err != nil {
+		t.Fatal(err)
+	}
+	go session.respondLoop()
+	session.enqueueUtterance([]int16{1000, -1000, 500, -500})
+
+	select {
+	case <-synth.firstStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("最初の断片の音声合成が始まらない")
+	}
+	select {
+	case <-streamer.startedRest:
+	case <-time.After(3 * time.Second):
+		t.Fatal("最初の断片のあとテキスト生成が止まっている")
+	}
+	got := synth.snapshot()
+	if len(got) != 1 || got[0] != "前半です。" {
+		t.Fatalf("音声合成を待たずに次の文へ進めていない: %q", got)
+	}
+
+	release()
+	waitFor(t, "2断片目の音声合成", func() bool {
+		return len(synth.snapshot()) >= 2
+	})
+	got = synth.snapshot()
+	if len(got) != 2 || got[0] != "前半です。" || got[1] != "後半です。" {
+		t.Fatalf("合成順=%q", got)
+	}
+}

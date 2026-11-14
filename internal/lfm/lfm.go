@@ -139,6 +139,19 @@ func (s *Session) Close() {
 
 // RespondText は 1 発話分の PCM16 を送り、モデルが返したテキストを返す。
 func (s *Session) RespondText(ctx context.Context, pcm []int16, sampleRate int) (string, error) {
+	return s.respond(ctx, pcm, sampleRate, nil)
+}
+
+// StreamText は 1 発話分の PCM16 を送り、読み上げできる断片が揃うたびに onChunk を呼ぶ。
+// 全文の生成完了を待たない。戻り値は返答全文。
+func (s *Session) StreamText(ctx context.Context, pcm []int16, sampleRate int, onChunk func(chunk string) error) (string, error) {
+	if onChunk == nil {
+		return "", errors.New("テキストの受け取り先がありません")
+	}
+	return s.respond(ctx, pcm, sampleRate, onChunk)
+}
+
+func (s *Session) respond(ctx context.Context, pcm []int16, sampleRate int, onChunk func(string) error) (string, error) {
 	if len(pcm) == 0 {
 		return "", errors.New("音声が空です")
 	}
@@ -204,10 +217,17 @@ func (s *Session) RespondText(ctx context.Context, pcm []int16, sampleRate int) 
 	}
 
 	var text strings.Builder
+	var seg segmenter
 	for {
 		event, err := readEvent(s.conn)
 		if err != nil {
-			return "", err
+			out := strings.TrimSpace(text.String())
+			if onChunk != nil && ctx.Err() == nil {
+				if chunkErr := emitChunks(onChunk, seg.Flush()); chunkErr != nil {
+					return out, chunkErr
+				}
+			}
+			return out, err
 		}
 		switch event.Type {
 		case "error":
@@ -215,23 +235,44 @@ func (s *Session) RespondText(ctx context.Context, pcm []int16, sampleRate int) 
 			if event.Error != nil && event.Error.Message != "" {
 				message = event.Error.Message
 			}
-			return "", errors.New(message)
+			return strings.TrimSpace(text.String()), errors.New(message)
 		case "response.output_text.delta":
-			if event.Delta != "" {
-				slog.Debug("モデルの文字", "text", event.Delta)
-				text.WriteString(event.Delta)
+			if event.Delta == "" {
+				continue
+			}
+			slog.Debug("モデルの文字", "text", event.Delta)
+			text.WriteString(event.Delta)
+			if onChunk == nil {
+				continue
+			}
+			if err := emitChunks(onChunk, seg.Push(event.Delta)); err != nil {
+				return strings.TrimSpace(text.String()), err
 			}
 		case "response.done":
 			if status := responseStatus(event.Response); status != "" && status != "completed" {
-				return "", fmt.Errorf("返事が完了していない: %s", status)
+				return strings.TrimSpace(text.String()), fmt.Errorf("返事が完了していない: %s", status)
 			}
 			out := strings.TrimSpace(text.String())
 			if out == "" {
 				return "", errors.New("返事の文字がありません")
 			}
+			if onChunk != nil {
+				if err := emitChunks(onChunk, seg.Flush()); err != nil {
+					return out, err
+				}
+			}
 			return out, nil
 		}
 	}
+}
+
+func emitChunks(onChunk func(string) error, chunks []string) error {
+	for _, chunk := range chunks {
+		if err := onChunk(chunk); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Turn は pcm をモデルの入力レートに合わせ、返事の音声を返す。
