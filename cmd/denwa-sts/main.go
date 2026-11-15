@@ -1,4 +1,4 @@
-// Command denwa-sts は ARI の着信音声を VAD で区切り、LFM3-Omni で返答テキストを生成して読み上げる。
+// Command denwa-sts は ARI の着信音声を VAD で区切り、Gemma 4 E4B で返答テキストを生成して読み上げる。
 // 日本語はずんだもん、英語は Piper。
 //
 // 起動: /home/denwa/sts/denwa-sts
@@ -13,12 +13,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"denwa-sts/internal/app"
 	"denwa-sts/internal/ari"
 	"denwa-sts/internal/call"
 	"denwa-sts/internal/config"
-	"denwa-sts/internal/lfm"
+	"denwa-sts/internal/gemma"
 	"denwa-sts/internal/synth"
 )
 
@@ -30,8 +31,9 @@ func main() {
 }
 
 func run() error {
-	server := flag.String("server", lfm.DefaultServerURL, "llama-server の /v1/realtime")
-	instructions := flag.String("instructions", lfm.DefaultPhoneInstructions, "モデルへの指示")
+	server := flag.String("server", gemma.DefaultServerURL, "llama-server の /v1/chat/completions")
+	model := flag.String("model", gemma.DefaultModel, "llama-server に渡すモデル名")
+	instructions := flag.String("instructions", gemma.DefaultPhoneInstructions, "モデルへの指示")
 	envPath := flag.String("env", config.EnvPath, "ARI 認証情報ファイルのパス")
 	logPath := flag.String("log", config.DefaultLogPath, "ログファイルパス（空なら標準出力のみ）")
 	flag.Parse()
@@ -65,15 +67,16 @@ func run() error {
 	greeting := append(append(japanese, gap...), english...)
 	slog.Info("読み上げ暖機完了", "ja_bytes", len(japanese), "en_bytes", len(english))
 
-	client := lfm.Client{
+	client := gemma.Client{
 		ServerURL:    *server,
+		Model:        *model,
 		Instructions: *instructions,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("起動", "app", config.AppName, "server", client.ServerURL, "log", *logPath)
+	slog.Info("起動", "app", config.AppName, "server", client.ServerURL, "model", client.Model, "log", *logPath)
 	application := app.New(ari.NewClient(creds), call.Options{
 		DialResponder: func(ctx context.Context) (call.Responder, error) {
 			return client.Dial(ctx)
@@ -83,7 +86,44 @@ func run() error {
 		RTPBindHost:      config.RTPBindHost,
 		FallbackPeerHost: config.ARIHost,
 	})
+	go keepModelWarm(ctx, client, application)
 	application.RunForever(ctx)
 	slog.Info("停止")
 	return nil
+}
+
+// keepModelWarm は起動直後と通話のない待ち受け中に軽量推論を送り、
+// 長時間アイドルによるモデル重みのページアウト（初回20秒遅延）を防ぐ。
+func keepModelWarm(ctx context.Context, client gemma.Client, application *app.App) {
+	const (
+		warmupInterval = 4 * time.Minute
+		warmupTimeout  = 45 * time.Second
+	)
+	run := func() {
+		if application.ActiveCalls() > 0 {
+			return
+		}
+		wCtx, cancel := context.WithTimeout(ctx, warmupTimeout)
+		defer cancel()
+		started := time.Now()
+		if err := client.Warmup(wCtx); err != nil {
+			if ctx.Err() == nil {
+				slog.Warn("モデル暖機失敗", "error", err)
+			}
+			return
+		}
+		slog.Debug("モデル暖機完了", "elapsed", time.Since(started).Round(10*time.Millisecond))
+	}
+
+	run()
+	ticker := time.NewTicker(warmupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }

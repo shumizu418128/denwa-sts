@@ -1,4 +1,4 @@
-package lfm
+package segment
 
 import (
 	"strings"
@@ -6,7 +6,7 @@ import (
 )
 
 func feed(deltas ...string) []string {
-	var seg segmenter
+	var seg Segmenter
 	var out []string
 	for _, delta := range deltas {
 		out = append(out, seg.Push(delta)...)
@@ -15,42 +15,30 @@ func feed(deltas ...string) []string {
 	return out
 }
 
-func TestSegmenterSplitsOnSentenceAfterNextRune(t *testing.T) {
-	input := "こんにちは。明日は晴れです。"
-	var seg segmenter
-	var got []string
-	emittedAt := -1
-	runes := []rune(input)
-	for i, r := range runes {
-		parts := seg.Push(string(r))
-		if len(parts) > 0 && emittedAt < 0 {
-			emittedAt = i
-		}
-		got = append(got, parts...)
+func TestSegmenterSplitsOnJapaneseSentenceEnd(t *testing.T) {
+	var seg Segmenter
+	if parts := seg.Push("こんにちは。"); len(parts) != 1 || parts[0] != "こんにちは。" {
+		t.Fatalf("句点で断片が出ていない: %q", parts)
 	}
-	if emittedAt < 0 || emittedAt >= len(runes)-1 {
-		t.Fatalf("文の途中で断片が出ていない at=%d len=%d got=%q", emittedAt, len(runes), got)
+	parts := seg.Push("明日は晴れです。")
+	if len(parts) != 1 || parts[0] != "明日は晴れです。" {
+		t.Fatalf("parts=%q", parts)
 	}
-	if len(got) != 1 || got[0] != "こんにちは。" {
-		t.Fatalf("途中結果=%q", got)
-	}
-	rest := seg.Flush()
-	if len(rest) != 1 || rest[0] != "明日は晴れです。" {
+	if rest := seg.Flush(); len(rest) != 0 {
 		t.Fatalf("flush=%q", rest)
 	}
 }
 
 func TestSegmenterHoldsClosingQuote(t *testing.T) {
-	var seg segmenter
-	if parts := seg.Push("「はい。」"); len(parts) != 0 {
+	var seg Segmenter
+	if parts := seg.Push("「はい。"); len(parts) != 0 {
 		t.Fatalf("閉じ括弧を待たずに出した: %q", parts)
 	}
-	parts := seg.Push("わかった。")
-	if len(parts) != 1 || parts[0] != "「はい。」" {
+	parts := seg.Push("」わかった。")
+	if len(parts) != 2 || parts[0] != "「はい。」" || parts[1] != "わかった。" {
 		t.Fatalf("parts=%q", parts)
 	}
-	rest := seg.Flush()
-	if len(rest) != 1 || rest[0] != "わかった。" {
+	if rest := seg.Flush(); len(rest) != 0 {
 		t.Fatalf("flush=%q", rest)
 	}
 }
@@ -63,8 +51,8 @@ func TestSegmenterKeepsThousandsSeparator(t *testing.T) {
 }
 
 func TestSegmenterSplitsLongClauseAtComma(t *testing.T) {
-	head := strings.Repeat("あ", weakMinRunes)
-	var seg segmenter
+	head := strings.Repeat("あ", WeakMinRunes)
+	var seg Segmenter
 	if parts := seg.Push(head + "、"); len(parts) != 1 || parts[0] != head+"、" {
 		t.Fatalf("parts=%q", parts)
 	}
@@ -75,10 +63,10 @@ func TestSegmenterSplitsLongClauseAtComma(t *testing.T) {
 }
 
 func TestSegmenterForcesCutWithoutPunctuation(t *testing.T) {
-	var seg segmenter
-	body := strings.Repeat("あ", hardMaxRunes+8)
+	var seg Segmenter
+	body := strings.Repeat("あ", HardMaxRunes+8)
 	parts := seg.Push(body)
-	if len(parts) != 1 || len([]rune(parts[0])) != hardMaxRunes {
+	if len(parts) != 1 || len([]rune(parts[0])) != HardMaxRunes {
 		t.Fatalf("parts=%q", parts)
 	}
 	rest := seg.Flush()
@@ -95,16 +83,15 @@ func TestSegmenterFlushKeepsShortReply(t *testing.T) {
 }
 
 func TestSegmenterSplitsEnglishSentenceAfterNextRune(t *testing.T) {
-	var seg segmenter
+	var seg Segmenter
 	if parts := seg.Push("Hello."); len(parts) != 0 {
 		t.Fatalf("文末で確定していない: %q", parts)
 	}
 	parts := seg.Push(" How are you?")
-	if len(parts) != 1 || parts[0] != "Hello." {
+	if len(parts) != 2 || parts[0] != "Hello." || parts[1] != "How are you?" {
 		t.Fatalf("parts=%q", parts)
 	}
-	rest := seg.Flush()
-	if len(rest) != 1 || rest[0] != "How are you?" {
+	if rest := seg.Flush(); len(rest) != 0 {
 		t.Fatalf("flush=%q", rest)
 	}
 }
@@ -125,7 +112,7 @@ func TestSegmenterKeepsDomainDot(t *testing.T) {
 
 func TestSegmenterCutsEnglishOnWordBoundary(t *testing.T) {
 	body := "Please hold while I look up your account details right now"
-	if len([]rune(body)) <= hardMaxRunes {
+	if len([]rune(body)) <= HardMaxRunes {
 		t.Fatalf("len=%d", len([]rune(body)))
 	}
 	got := feed(body)

@@ -1,4 +1,5 @@
-package lfm
+// Package segment はモデルの差分テキストを、読み上げを始められる断片に分ける。
+package segment
 
 import (
 	"strings"
@@ -6,19 +7,20 @@ import (
 )
 
 const (
-	// weakMinRunes は読点で区切って読み始めるために必要な最小文字数。
-	weakMinRunes = 12
-	// hardMaxRunes は句読点が無いときに強制的に区切る文字数。
-	hardMaxRunes = 32
+	// WeakMinRunes は読点で区切って読み始めるために必要な最小文字数。
+	WeakMinRunes = 12
+	// HardMaxRunes は句読点が無いときに強制的に区切る文字数。
+	HardMaxRunes = 32
 )
 
-// segmenter はモデルの差分テキストを、読み上げを始められる断片に分ける。
+// Segmenter はモデルの差分テキストを、読み上げを始められる断片に分ける。
 // 文末がバッファの終端にあるあいだは、閉じ括弧が続くかもしれないので保留する。
-type segmenter struct {
+type Segmenter struct {
 	buf []rune
 }
 
-func (s *segmenter) Push(delta string) []string {
+// Push は差分を追加し、読み上げ可能な断片を返す。
+func (s *Segmenter) Push(delta string) []string {
 	if delta == "" {
 		return nil
 	}
@@ -26,11 +28,12 @@ func (s *segmenter) Push(delta string) []string {
 	return s.drain(false)
 }
 
-func (s *segmenter) Flush() []string {
+// Flush は残りをすべて断片として返す。
+func (s *Segmenter) Flush() []string {
 	return s.drain(true)
 }
 
-func (s *segmenter) drain(final bool) []string {
+func (s *Segmenter) drain(final bool) []string {
 	var out []string
 	for {
 		cut := nextCut(s.buf, final)
@@ -79,22 +82,27 @@ func nextCut(buf []rune, final bool) int {
 		if speakableRunes(buf[:end]) == 0 {
 			continue
 		}
-		if weak && speakableRunes(buf[:end]) < weakMinRunes {
-			if end <= hardMaxRunes {
+		if weak && speakableRunes(buf[:end]) < WeakMinRunes {
+			if end <= HardMaxRunes {
 				lastWeak = end
 			}
 			continue
 		}
-		// 文末が終端なら閉じ括弧を待つ。短い文は生成完了までまとめる。
-		if strong && end == len(buf) && !final && end <= hardMaxRunes {
+		// 文末が終端のとき、未閉じの開き括弧があれば閉じを待つ。
+		// それ以外はすぐ切って読み上げを始め、短い文の完了待ちで初声を遅らせない。
+		if strong && end == len(buf) && !final && hasUnclosedOpener(buf[:end]) {
 			return 0
 		}
-		if end > hardMaxRunes {
+		// 英語のピリオドは次の文字で文末か略語かを確認する。
+		if strong && end == len(buf) && !final && buf[i] == '.' {
+			return 0
+		}
+		if end > HardMaxRunes {
 			return forcedCut(buf, lastWeak)
 		}
 		return end
 	}
-	if len(buf) >= hardMaxRunes {
+	if len(buf) >= HardMaxRunes {
 		return forcedCut(buf, lastWeak)
 	}
 	if final {
@@ -104,10 +112,10 @@ func nextCut(buf []rune, final bool) int {
 }
 
 func forcedCut(buf []rune, lastWeak int) int {
-	if lastWeak >= 4 && lastWeak <= hardMaxRunes && speakableRunes(buf[:lastWeak]) >= 4 {
+	if lastWeak >= 4 && lastWeak <= HardMaxRunes && speakableRunes(buf[:lastWeak]) >= 4 {
 		return lastWeak
 	}
-	cut := hardMaxRunes
+	cut := HardMaxRunes
 	if cut > len(buf) {
 		cut = len(buf)
 	}
@@ -184,6 +192,29 @@ func isCloser(r rune) bool {
 	default:
 		return false
 	}
+}
+
+func isOpener(r rune) bool {
+	switch r {
+	case '「', '『', '（', '(', '【', '〈', '《', '〔', '〖', '"', '\'':
+		return true
+	default:
+		return false
+	}
+}
+
+func hasUnclosedOpener(buf []rune) bool {
+	depth := 0
+	for _, r := range buf {
+		if isOpener(r) {
+			depth++
+			continue
+		}
+		if isCloser(r) && depth > 0 {
+			depth--
+		}
+	}
+	return depth > 0
 }
 
 func isDigit(r rune) bool {

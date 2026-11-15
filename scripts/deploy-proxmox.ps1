@@ -81,7 +81,7 @@ try {
 	scp -o BatchMode=yes $Archive "${RemoteHost}:${RemoteBuild}/src.tar"
 	Assert-LastExit "アーカイブ送信"
 
-	$remote = "set -euo pipefail; cd $RemoteBuild; tar -xf src.tar; rm -f src.tar; test -f internal/lfm/segment.go; chmod +x scripts/proxmox-build.sh; DENWA_STS_BUILD_DIR=$RemoteBuild bash scripts/proxmox-build.sh"
+	$remote = "set -euo pipefail; cd $RemoteBuild; tar -xf src.tar; rm -f src.tar; test -f internal/gemma/gemma.go; test -f internal/segment/segment.go; chmod +x scripts/proxmox-build.sh; DENWA_STS_BUILD_DIR=$RemoteBuild bash scripts/proxmox-build.sh"
 	# gcc はログイン時の PATH（~/.local/bin）にだけ入っている
 	ssh -o BatchMode=yes $RemoteHost "bash -lc '$remote'"
 	Assert-LastExit "リモートビルド"
