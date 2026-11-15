@@ -470,3 +470,75 @@ type markerSynth struct {
 func (s markerSynth) SynthesizeULaw(_ string) ([]byte, error) {
 	return bytes.Repeat([]byte{s.marker}, config.FrameSamples), nil
 }
+
+type delayedStreamer struct {
+	delay time.Duration
+	chunk string
+}
+
+func (d delayedStreamer) RespondText(context.Context, []int16, int) (string, error) {
+	return d.chunk, nil
+}
+
+func (d delayedStreamer) Close() {}
+
+func (d delayedStreamer) StreamText(ctx context.Context, _ []int16, _ int, onChunk func(string) error) (string, error) {
+	timer := time.NewTimer(d.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-timer.C:
+	}
+	if err := onChunk(d.chunk); err != nil {
+		return "", err
+	}
+	return d.chunk, nil
+}
+
+func TestPlaybackToneDoesNotAccumulate(t *testing.T) {
+	const marker = 0x10
+	received := make(chan []byte, 128)
+	peer, err := newLoopbackRTP(t, received)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := NewSession(Options{
+		ARI:              &fakeARI{},
+		DialResponder:    func(context.Context) (Responder, error) { return delayedStreamer{delay: 300 * time.Millisecond, chunk: "はい。"}, nil },
+		Synth:            markerSynth{marker: marker},
+		RTPBindHost:      "127.0.0.1",
+		FallbackPeerHost: "127.0.0.1",
+	}, "chan-tone", "200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Cleanup()
+	if err := session.rtp.SetPeer("127.0.0.1", peer); err != nil {
+		t.Fatal(err)
+	}
+
+	go session.respondLoop()
+	started := time.Now()
+	session.enqueueUtterance([]int16{1000, -1000, 500, -500})
+
+	// 300ms の待ち時間中に保留音が実時間以上に溜まらないこと。
+	// 15フレーム(300ms) + 先読み(2) + 無音(5) + 返答(1) = 約23フレーム以内に返答が届くはず。
+	deadline := time.After(2 * time.Second)
+	var total int
+	for {
+		select {
+		case pkt := <-received:
+			total++
+			if len(pkt) == config.FrameSamples && bytes.Count(pkt, []byte{marker}) == len(pkt) {
+				if total > 26 {
+					t.Fatalf("保留音が過剰に溜まった: packets=%d elapsed=%v", total, time.Since(started))
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatalf("返答音声が届かない: packets=%d", total)
+		}
+	}
+}

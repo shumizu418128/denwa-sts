@@ -11,7 +11,7 @@ const (
 	defaultPreRollFrames      = 15  // 300 ms
 	defaultStartFrames        = 2   // 40 ms
 	defaultBargeInFrames      = 4   // 80 ms
-	defaultEndSilenceFrames   = 40  // 800 ms
+	defaultEndSilenceFrames   = 25  // 500 ms
 	defaultMinSpeechFrames    = 8   // 160 ms
 	defaultMaxUtteranceFrames = 750 // 15 s
 	defaultMinStartRMS        = 180.0

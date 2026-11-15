@@ -26,8 +26,9 @@ func TestSessionMultiTurnStream(t *testing.T) {
 				return
 			}
 			var req struct {
-				Messages []chatMessage `json:"messages"`
-				Stream   bool          `json:"stream"`
+				Messages  []chatMessage `json:"messages"`
+				Stream    bool          `json:"stream"`
+				MaxTokens int           `json:"max_tokens"`
 			}
 			if err := json.Unmarshal(body, &req); err != nil {
 				t.Errorf("json: %v", err)
@@ -36,10 +37,26 @@ func TestSessionMultiTurnStream(t *testing.T) {
 			if !req.Stream {
 				t.Error("stream=false")
 			}
+			if req.MaxTokens != maxReplyTokens {
+				t.Errorf("max_tokens=%d", req.MaxTokens)
+			}
 			if len(req.Messages) < 2 || req.Messages[0].Role != "system" {
 				t.Errorf("messages=%v", req.Messages)
 			}
 			turns++
+			if turns == 2 {
+				// 過去ターンの user は音声ではなくスタブ。最新 user だけ input_audio。
+				audioMsgs := 0
+				for _, msg := range req.Messages {
+					raw, _ := json.Marshal(msg.Content)
+					if strings.Contains(string(raw), "input_audio") {
+						audioMsgs++
+					}
+				}
+				if audioMsgs != 1 {
+					t.Errorf("history audio msgs=%d body=%s", audioMsgs, string(body))
+				}
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			flusher, _ := w.(http.Flusher)
 			writeSSE(w, map[string]any{
@@ -234,5 +251,51 @@ func TestDialFailsOnBadHealth(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "health") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestWarmup(t *testing.T) {
+	var gotReq struct {
+		Stream             bool           `json:"stream"`
+		MaxTokens          int            `json:"max_tokens"`
+		Messages           []chatMessage  `json:"messages"`
+		ChatTemplateKwargs map[string]any `json:"chat_template_kwargs"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("body: %v", err)
+			return
+		}
+		if err := json.Unmarshal(body, &gotReq); err != nil {
+			t.Errorf("json: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := (Client{ServerURL: server.URL + "/v1/chat/completions"}).Warmup(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotReq.Stream {
+		t.Error("stream=true")
+	}
+	if gotReq.MaxTokens != 1 {
+		t.Errorf("max_tokens=%d", gotReq.MaxTokens)
+	}
+	if len(gotReq.Messages) != 2 || gotReq.Messages[0].Role != "system" {
+		t.Errorf("messages=%v", gotReq.Messages)
+	}
+	if gotReq.ChatTemplateKwargs["enable_thinking"] != false {
+		t.Errorf("chat_template_kwargs=%v", gotReq.ChatTemplateKwargs)
 	}
 }

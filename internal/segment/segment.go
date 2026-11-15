@@ -88,8 +88,13 @@ func nextCut(buf []rune, final bool) int {
 			}
 			continue
 		}
-		// 文末が終端なら閉じ括弧を待つ。短い文は生成完了までまとめる。
-		if strong && end == len(buf) && !final && end <= HardMaxRunes {
+		// 文末が終端のとき、未閉じの開き括弧があれば閉じを待つ。
+		// それ以外はすぐ切って読み上げを始め、短い文の完了待ちで初声を遅らせない。
+		if strong && end == len(buf) && !final && hasUnclosedOpener(buf[:end]) {
+			return 0
+		}
+		// 英語のピリオドは次の文字で文末か略語かを確認する。
+		if strong && end == len(buf) && !final && buf[i] == '.' {
 			return 0
 		}
 		if end > HardMaxRunes {
@@ -187,6 +192,29 @@ func isCloser(r rune) bool {
 	default:
 		return false
 	}
+}
+
+func isOpener(r rune) bool {
+	switch r {
+	case '「', '『', '（', '(', '【', '〈', '《', '〔', '〖', '"', '\'':
+		return true
+	default:
+		return false
+	}
+}
+
+func hasUnclosedOpener(buf []rune) bool {
+	depth := 0
+	for _, r := range buf {
+		if isOpener(r) {
+			depth++
+			continue
+		}
+		if isCloser(r) && depth > 0 {
+			depth--
+		}
+	}
+	return depth > 0
 }
 
 func isDigit(r rune) bool {

@@ -15,11 +15,16 @@ LFM3 の `/v1/realtime` はやめ、音声対応の Gemma を chat completions �
 
 ```bash
 # 例: ggml-org の GGUF（このリポは Q4_0 / Q8_0。Q4_K_M は無い）
-# CPU なら -ngl 0、-t はコア数に合わせる。mmproj は -hf が一緒に取る
+# CPU なら -ngl 0、GPU があれば -ngl 99
+# -t 4 -tb 6 で VOICEVOX 合成用の CPU 余地を残しつつプロンプト評価は 6 スレッドを使う
+# -np 1 -c 4096 でスロットを 1 本に絞り、-lm mmap+mlock -lzm off でページアウトを防ぐ（要 ulimit -l 解除 / root）
 /home/denwa/sts/llama-b11960/llama-server \
   -hf ggml-org/gemma-4-E4B-it-GGUF:Q4_0 \
   --host 127.0.0.1 --port 8080 \
-  -c 8192 -t 6 --reasoning off
+  --jinja -np 1 -c 4096 -t 4 -tb 6 \
+  -lm mmap+mlock -lzm off \
+  --reasoning off \
+  --chat-template-kwargs '{"enable_thinking":false}'
 ```
 
 `denwa-sts` の既定は `http://127.0.0.1:8080/v1/chat/completions`。

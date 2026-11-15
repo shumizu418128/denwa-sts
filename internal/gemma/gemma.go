@@ -27,14 +27,18 @@ const (
 	// DefaultModel は llama-server に渡すモデル名。実体は起動時の -hf で決まる。
 	DefaultModel = "gemma-4-e4b"
 	// DefaultPhoneInstructions は電話対話向けの指示。
-	DefaultPhoneInstructions = "You are on a phone call. Listen to the caller's audio and reply in plain spoken text only. Do not use markdown, bullet points, or special symbols. Reply in the same language the caller just used, either Japanese or English. Your reply will be read aloud by a text-to-speech engine, so keep sentences natural for speech."
+	DefaultPhoneInstructions = "You are on a phone call. Listen to the caller's audio and reply in plain spoken text only, without markdown, bullet points, or special symbols. Reply in the same language the caller just used, either Japanese or English. Answer naturally and concisely in one or two sentences suitable for speech."
 
 	defaultInputRate = 16000
 	// headerTimeout は応答ヘッダ待ち。本文ストリームは Client.Timeout せず context で打ち切る。
 	headerTimeout = 60 * time.Second
-	// maxHistoryTurns は保持する user/assistant の往復数。音声トークンが増えすぎないように抑える。
-	maxHistoryTurns = 4
-	userTurnPrompt  = "Reply to the caller now."
+	// maxHistoryTurns は保持する user/assistant の往復数。過去音声は載せないが、文脈は短く保つ。
+	maxHistoryTurns = 2
+	// maxReplyTokens は電話向けの返答上限。長文の暴走だけを抑えつつ1〜2文を言い切れる余裕を持たせる。
+	maxReplyTokens = 96
+	userTurnPrompt = "Reply to the caller now."
+	// historyUserStub は過去ターンの音声を再送しないための置き換え。
+	historyUserStub = "(Earlier caller audio; you already replied.)"
 )
 
 // Client は /v1/chat/completions への接続設定。
@@ -74,26 +78,67 @@ type inputAudio struct {
 	Format string `json:"format"`
 }
 
-// Dial は llama-server の survivability を確認し、通話用 Session を返す。
-func (c Client) Dial(ctx context.Context) (*Session, error) {
-	endpoint := c.ServerURL
+func (c Client) resolved() (endpoint, model, instructions string, httpClient *http.Client) {
+	endpoint = c.ServerURL
 	if endpoint == "" {
 		endpoint = DefaultServerURL
 	}
-	model := c.Model
+	model = c.Model
 	if model == "" {
 		model = DefaultModel
 	}
-	instructions := c.Instructions
+	instructions = c.Instructions
 	if instructions == "" {
 		instructions = DefaultPhoneInstructions
 	}
-	httpClient := c.HTTPClient
+	httpClient = c.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Transport: &http.Transport{ResponseHeaderTimeout: headerTimeout},
 		}
 	}
+	return endpoint, model, instructions, httpClient
+}
+
+// Warmup は 1 トークンだけ生成させ、モデルの重みページとシステム指示の KV キャッシュを温める。
+func (c Client) Warmup(ctx context.Context) error {
+	endpoint, model, instructions, httpClient := c.resolved()
+	body, err := json.Marshal(map[string]any{
+		"model": model,
+		"messages": []chatMessage{
+			{Role: "system", Content: instructions},
+			{Role: "user", Content: "ping"},
+		},
+		"stream":     false,
+		"max_tokens": 1,
+		"chat_template_kwargs": map[string]any{
+			"enable_thinking": false,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("warmup JSONを作れない: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("warmup リクエストの準備に失敗した: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("warmup リクエストに失敗した: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("warmup がエラーを返した: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(errBody)))
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// Dial は llama-server の survivability を確認し、通話用 Session を返す。
+func (c Client) Dial(ctx context.Context) (*Session, error) {
+	endpoint, model, instructions, httpClient := c.resolved()
 
 	healthURL, err := healthURLFrom(endpoint)
 	if err != nil {
@@ -182,9 +227,10 @@ func (s *Session) respond(ctx context.Context, pcm []int16, sampleRate int, onCh
 	messages = append(messages, userMsg)
 
 	body, err := json.Marshal(map[string]any{
-		"model":    s.model,
-		"messages": messages,
-		"stream":   true,
+		"model":      s.model,
+		"messages":   messages,
+		"stream":     true,
+		"max_tokens": maxReplyTokens,
 		"chat_template_kwargs": map[string]any{
 			"enable_thinking": false,
 		},
@@ -220,7 +266,11 @@ func (s *Session) respond(ctx context.Context, pcm []int16, sampleRate int, onCh
 
 	s.mu.Lock()
 	if !s.closed {
-		s.history = append(s.history, userMsg, chatMessage{Role: "assistant", Content: text})
+		// 過去の user 音声を履歴に残すと prefills が肥大して初声が遅くなる。
+		s.history = append(s.history,
+			chatMessage{Role: "user", Content: historyUserStub},
+			chatMessage{Role: "assistant", Content: text},
+		)
 		s.history = trimHistory(s.history, maxHistoryTurns)
 	}
 	s.mu.Unlock()

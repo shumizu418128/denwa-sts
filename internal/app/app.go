@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"denwa-sts/internal/ari"
@@ -20,6 +21,12 @@ type App struct {
 
 	sessions       map[string]*call.Session
 	mediaToSession map[string]*call.Session
+	activeCalls    atomic.Int64
+}
+
+// ActiveCalls は現在進行中の通話数を返す。
+func (a *App) ActiveCalls() int {
+	return int(a.activeCalls.Load())
 }
 
 // New は App を作る。options.ARI には client を使うので設定しなくてよい。
@@ -133,6 +140,7 @@ func (a *App) onCallStart(channel *ari.Channel) {
 	}
 	a.sessions[channel.ID] = session
 	a.mediaToSession[session.MediaID()] = session
+	a.activeCalls.Store(int64(len(a.sessions)))
 	session.Start()
 }
 
@@ -143,6 +151,7 @@ func (a *App) onCallEnd(channelID string) {
 	}
 	delete(a.sessions, channelID)
 	delete(a.mediaToSession, session.MediaID())
+	a.activeCalls.Store(int64(len(a.sessions)))
 	slog.Info("相手切断 StasisEnd", "channel", channelID)
 	// 後始末は ARI を呼ぶので、イベントの処理を止めないよう別の goroutine で行う
 	go session.Cleanup()
@@ -160,4 +169,5 @@ func (a *App) cleanupAll() {
 	}
 	clear(a.sessions)
 	clear(a.mediaToSession)
+	a.activeCalls.Store(0)
 }

@@ -26,7 +26,7 @@ const (
 	streamChanSize    = 64
 	textChunkQueue    = 8
 	// toneLeadFrames は保留音を、RTP の 20ms 間隔より少し先まで溜める量。
-	toneLeadFrames = 3
+	toneLeadFrames = 2
 )
 
 var unusablePeerAddrs = map[string]bool{"": true, "0.0.0.0": true, "127.0.0.1": true, "::": true}
@@ -424,10 +424,11 @@ func (s *Session) openPlayback(turnCtx context.Context) *utterancePlayback {
 			<-toneDone
 		},
 	}
-	// 最初の応答音声まで「プップッ」という保留音を流す。
-	// 数フレーム先まで溜めて、送信側が空いた瞬間に無音を挟まないようにする。
+	// 最初の応答音声まで「プップッ」という保留音を 20ms 周期で流す。
+	// 初回だけ toneLeadFrames 分だけ先に出し、以降は実時間ペースを守って滞留させない。
 	go func() {
 		defer close(toneDone)
+		nextTick := time.Now()
 		for frameIdx := 0; ; frameIdx++ {
 			select {
 			case <-turnCtx.Done():
@@ -436,10 +437,18 @@ func (s *Session) openPlayback(turnCtx context.Context) *utterancePlayback {
 				return
 			case ulawCh <- audio.ThinkingToneFrame(frameIdx):
 			}
-			if len(ulawCh) < toneLeadFrames {
+			if frameIdx+1 < toneLeadFrames {
 				continue
 			}
-			timer := time.NewTimer(config.FrameDuration)
+			nextTick = nextTick.Add(config.FrameDuration)
+			wait := time.Until(nextTick)
+			if wait <= 0 {
+				if wait < -2*config.FrameDuration {
+					nextTick = time.Now()
+				}
+				continue
+			}
+			timer := time.NewTimer(wait)
 			select {
 			case <-turnCtx.Done():
 				timer.Stop()
@@ -609,6 +618,7 @@ func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreame
 			}
 		}
 	}
+	textElapsed := time.Since(started).Round(10 * time.Millisecond)
 	close(textDone)
 	close(chunks)
 	result := <-synthCh
@@ -629,7 +639,8 @@ func (s *Session) respondStreaming(turnCtx context.Context, streamer TextStreame
 		return
 	}
 	slog.Info("STS応答完了", "channel", s.channelID, "text", text,
-		"bytes", result.bytes, "sent_ok", sentOK, "interrupted", turnCtx.Err() != nil, "elapsed", time.Since(started).Round(10*time.Millisecond))
+		"bytes", result.bytes, "sent_ok", sentOK, "interrupted", turnCtx.Err() != nil,
+		"text_elapsed", textElapsed, "elapsed", time.Since(started).Round(10*time.Millisecond))
 }
 
 func leadSilence() []byte {

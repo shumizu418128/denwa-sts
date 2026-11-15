@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"denwa-sts/internal/app"
 	"denwa-sts/internal/ari"
@@ -85,7 +86,44 @@ func run() error {
 		RTPBindHost:      config.RTPBindHost,
 		FallbackPeerHost: config.ARIHost,
 	})
+	go keepModelWarm(ctx, client, application)
 	application.RunForever(ctx)
 	slog.Info("停止")
 	return nil
+}
+
+// keepModelWarm は起動直後と通話のない待ち受け中に軽量推論を送り、
+// 長時間アイドルによるモデル重みのページアウト（初回20秒遅延）を防ぐ。
+func keepModelWarm(ctx context.Context, client gemma.Client, application *app.App) {
+	const (
+		warmupInterval = 4 * time.Minute
+		warmupTimeout  = 45 * time.Second
+	)
+	run := func() {
+		if application.ActiveCalls() > 0 {
+			return
+		}
+		wCtx, cancel := context.WithTimeout(ctx, warmupTimeout)
+		defer cancel()
+		started := time.Now()
+		if err := client.Warmup(wCtx); err != nil {
+			if ctx.Err() == nil {
+				slog.Warn("モデル暖機失敗", "error", err)
+			}
+			return
+		}
+		slog.Debug("モデル暖機完了", "elapsed", time.Since(started).Round(10*time.Millisecond))
+	}
+
+	run()
+	ticker := time.NewTicker(warmupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
